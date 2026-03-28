@@ -63,6 +63,31 @@ class LeagueClient:
             })
         return categories
 
+    def get_stat_weights(self):
+        """Points per stat from ESPN league settings (H2H points or category weights).
+
+        H2H category leagues often use 0 in the API; we treat that as weight 1.0 per category.
+        """
+        raw = self.league.settings._raw_scoring_settings
+        scoring_items = raw.get('scoringItems', [])
+        weights = {}
+        for item in scoring_items:
+            stat_id = item.get('statId')
+            name = STATS_MAP.get(stat_id)
+            if not name:
+                continue
+            pts = item.get('points')
+            if pts is None:
+                pts = 0
+            try:
+                w = float(pts)
+            except (TypeError, ValueError):
+                w = 0.0
+            if w == 0.0:
+                w = 1.0
+            weights[name] = w
+        return weights
+
     def get_current_matchup(self, team):
         """Return the current week's H2H category matchup for the given team."""
         try:

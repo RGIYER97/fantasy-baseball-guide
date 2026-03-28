@@ -29,3 +29,6 @@ YEAR = 2025
 ESPN_S2 = "paste_your_espn_s2_cookie_here"
 SWID = "{paste-your-swid-here}"
 TEAM_NAME = "Your Fantasy Team Name"
+
+# Optional: MLB season year for pybaseball FanGraphs leader stats (defaults to YEAR).
+# FANGRAPHS_SEASON = 2025

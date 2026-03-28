@@ -1,12 +1,13 @@
-from league_client import INVERSE_STATS, RATE_STATS
+from pybaseball_stats import lookup_batter, lookup_pitcher
 
 
 class Recommender:
-    def __init__(self, categories, matchup, roster, free_agents):
+    def __init__(self, categories, matchup, roster, free_agents, stat_weights=None):
         self.categories = categories
         self.matchup = matchup
         self.roster = roster
         self.free_agents = free_agents
+        self.stat_weights = stat_weights or {}
         self.batting_cats = [c for c in categories if c['is_batting']]
         self.pitching_cats = [c for c in categories if c['is_pitching']]
 
@@ -52,7 +53,7 @@ class Recommender:
     # Weekly recommendations — focus on flipping losing categories
     # ------------------------------------------------------------------
 
-    def get_weekly_recommendations(self, analysis, num=10):
+    def get_weekly_recommendations(self, analysis, num=10, hitters=None, pitchers=None):
         losing = [a for a in analysis if a['result'] == 'LOSS']
         if not losing:
             return {'hitters': [], 'pitchers': [], 'losing_categories': []}
@@ -60,8 +61,8 @@ class Recommender:
         losing_bat = [a for a in losing if a['is_batting']]
         losing_pit = [a for a in losing if a['is_pitching']]
 
-        hitters, pitchers = self._split_free_agents()
-
+        if hitters is None and pitchers is None:
+            hitters, pitchers = self._split_free_agents()
         hitter_recs = self._rank_for_categories(hitters, losing_bat)
         pitcher_recs = self._rank_for_categories(pitchers, losing_pit)
 
@@ -75,16 +76,21 @@ class Recommender:
     # Season recommendations — overall value across ALL categories
     # ------------------------------------------------------------------
 
-    def get_season_recommendations(self, num=10):
-        hitters, pitchers = self._split_free_agents()
+    def get_season_recommendations(self, num=10, hitters=None, pitchers=None):
+        if hitters is None and pitchers is None:
+            hitters, pitchers = self._split_free_agents()
 
-        hitter_recs = self._rank_for_categories(hitters, self.batting_cats)
-        pitcher_recs = self._rank_for_categories(pitchers, self.pitching_cats)
+        hitter_recs = self._rank_for_categories(hitters, self._cats_with_zero_margin(self.batting_cats))
+        pitcher_recs = self._rank_for_categories(pitchers, self._cats_with_zero_margin(self.pitching_cats))
 
         return {
             'hitters': hitter_recs[:num],
             'pitchers': pitcher_recs[:num],
         }
+
+    @staticmethod
+    def _cats_with_zero_margin(cats):
+        return [{**c, 'margin': 0} for c in cats]
 
     # ------------------------------------------------------------------
     # Drop candidates — roster players with lowest projected value
@@ -111,6 +117,23 @@ class Recommender:
         return candidates[:num]
 
     # ------------------------------------------------------------------
+    # Free-agent splits: ESPN projections vs FanGraphs (pybaseball) stats
+    # ------------------------------------------------------------------
+
+    def split_free_agents_fangraphs(self, bat_primary, bat_by_name, pit_primary, pit_by_name):
+        hitters, pitchers = [], []
+        for fa in self.free_agents:
+            if fa.position in ('SP', 'RP', 'P'):
+                proj = lookup_pitcher(fa.name, fa.proTeam, pit_primary, pit_by_name)
+                if proj:
+                    pitchers.append((fa, proj))
+            else:
+                proj = lookup_batter(fa.name, fa.proTeam, bat_primary, bat_by_name)
+                if proj:
+                    hitters.append((fa, proj))
+        return hitters, pitchers
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -127,11 +150,10 @@ class Recommender:
         return hitters, pitchers
 
     def _rank_for_categories(self, players_with_proj, target_cats):
-        """Rank players by a normalized composite score across *target_cats*.
+        """Rank players by normalized composite score across *target_cats*.
 
-        For each target category we normalise every player's projected value
-        to 0‒1 among the pool, then weight by how close the category margin
-        is (closer losses are more impactful to target).
+        Uses ESPN league stat weights from scoring settings. Weekly nuance: each
+        losing category's margin tightens the weight (same as before).
         """
         if not target_cats or not players_with_proj:
             return []
@@ -154,6 +176,7 @@ class Recommender:
         for fa, proj in players_with_proj:
             score = 0.0
             key_stats = {}
+            full_proj = dict(proj)
             for cat in target_cats:
                 name = cat['name']
                 val = proj.get(name)
@@ -168,25 +191,25 @@ class Recommender:
                     norm = 1.0 - norm
 
                 margin = abs(cat.get('margin', 0))
-                weight = 1.0 / (1.0 + margin * 0.05)
+                matchup_w = 1.0 / (1.0 + margin * 0.05)
+                league_w = float(self.stat_weights.get(name, 1.0))
 
-                score += norm * weight
+                score += norm * matchup_w * league_w
 
             if score > 0:
                 scored.append({
                     'player': fa,
                     'score': round(score, 3),
                     'key_stats': key_stats,
+                    'proj': full_proj,
                 })
 
         scored.sort(key=lambda x: x['score'], reverse=True)
         return scored
 
     def _composite_value(self, proj, cats):
-        """Quick scalar value for a player across a set of categories."""
         if not proj:
             return 0.0
-
         score = 0.0
         for cat in cats:
             name = cat['name']
@@ -204,3 +227,33 @@ class Recommender:
                 else:
                     score += val
         return round(score, 2)
+
+
+def consensus_pickups(espn_hitters, espn_pitchers, fg_hitters, fg_pitchers, top_n=25):
+    """Players appearing in the top *top_n* of both ESPN and FanGraphs lists."""
+    return (
+        _consensus_side(espn_hitters, fg_hitters, top_n),
+        _consensus_side(espn_pitchers, fg_pitchers, top_n),
+    )
+
+
+def _consensus_side(espn_list, fg_list, top_n):
+    rank_e = {rec['player'].playerId: (idx, rec) for idx, rec in enumerate(espn_list[:top_n])}
+    rank_f = {rec['player'].playerId: (idx, rec) for idx, rec in enumerate(fg_list[:top_n])}
+    shared = set(rank_e) & set(rank_f)
+    rows = []
+    for pid in shared:
+        ie, er = rank_e[pid]
+        jf, fr = rank_f[pid]
+        rows.append({
+            'player': er['player'],
+            'espn_rank': ie + 1,
+            'fg_rank': jf + 1,
+            'espn_score': er['score'],
+            'fg_score': fr['score'],
+            'score': round((er['score'] + fr['score']) / 2, 3),
+            'proj': er['proj'],
+            'proj_fg': fr['proj'],
+        })
+    rows.sort(key=lambda x: x['espn_rank'] + x['fg_rank'])
+    return rows
