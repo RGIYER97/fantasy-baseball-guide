@@ -1,0 +1,4 @@
+espn_api
+pybaseball
+pandas
+tabulate
