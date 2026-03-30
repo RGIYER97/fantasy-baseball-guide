@@ -11,6 +11,16 @@ A command-line tool that connects to your ESPN Fantasy Baseball league and recom
 5. **Overlap** — players who land in the top of **both** ESPN and FanGraphs rankings.
 6. **Drop candidates** — roster players with the lowest ESPN projected composite value (bench/IL first).
 
+### Add/drop pairings and category impact
+
+Pickup tables show **who to drop** to make a one-for-one swap work: for hitter recommendations, the weakest hitter on your roster (bench/IL prioritized); for pitchers, the weakest pitcher. A **`swap Δ`** row under each pickup lists the **projected change per scoring category** if you add that player and drop the suggested player (add projection minus drop projection, using the same stat source as that table—ESPN projections or FanGraphs season stats).
+
+Weekly and season sections use the same underlying projection rows; interpret “this week” vs “rest of season” from the section title, not from different stat feeds unless you run ESPN vs FanGraphs sources separately.
+
+### Injury filtering
+
+**Waiver targets** with any non-`ACTIVE` ESPN `injuryStatus` (e.g. OUT, DAY_TO_DAY, IL designations, SUSPENSION) are **excluded** from recommendations so injured free agents are not suggested as adds.
+
 **Note:** pybaseball pulls **season-to-date (or full-season) FanGraphs leader boards** for the year you set—not a separate Steamer/ZiPS projection export. Early in a season, FG numbers may be based on small samples.
 
 ## Dependencies
@@ -47,7 +57,7 @@ python main.py --source both   # overlap only (top of both lists)
 | `config_private.py` | Credentials (git-ignored) |
 | `league_client.py` | ESPN league, categories, stat weights, matchups |
 | `pybaseball_stats.py` | Load FG data via pybaseball; map rows → ESPN stat keys; name lookup |
-| `recommender.py` | Rankings, consensus |
+| `recommender.py` | Rankings, consensus, add/drop deltas, injury filter for FAs |
 | `main.py` | CLI |
 | `requirements.txt` | Dependencies |
 

@@ -1,5 +1,11 @@
 from pybaseball_stats import lookup_batter, lookup_pitcher
 
+INJURED_STATUSES = frozenset({
+    'OUT', 'DAY_TO_DAY', 'SUSPENSION',
+    'TEN_DAY_DL', 'FIFTEEN_DAY_DL', 'SIXTY_DAY_DL', 'SEVEN_DAY_DL',
+    'INJURED_RESERVE', 'PATERNITY', 'BEREAVEMENT',
+})
+
 
 class Recommender:
     def __init__(self, categories, matchup, roster, free_agents, stat_weights=None):
@@ -10,6 +16,16 @@ class Recommender:
         self.stat_weights = stat_weights or {}
         self.batting_cats = [c for c in categories if c['is_batting']]
         self.pitching_cats = [c for c in categories if c['is_pitching']]
+        self._hitter_drops = None
+        self._pitcher_drops = None
+
+    @staticmethod
+    def _is_available(player):
+        """Return True if the player is not on an injured/inactive list."""
+        status = getattr(player, 'injuryStatus', None)
+        if not status or status == 'ACTIVE':
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Matchup analysis
@@ -63,12 +79,15 @@ class Recommender:
 
         if hitters is None and pitchers is None:
             hitters, pitchers = self._split_free_agents()
-        hitter_recs = self._rank_for_categories(hitters, losing_bat)
-        pitcher_recs = self._rank_for_categories(pitchers, losing_pit)
+        hitter_recs = self._rank_for_categories(hitters, losing_bat)[:num]
+        pitcher_recs = self._rank_for_categories(pitchers, losing_pit)[:num]
+
+        self._attach_drop_info(hitter_recs, is_pitcher=False)
+        self._attach_drop_info(pitcher_recs, is_pitcher=True)
 
         return {
-            'hitters': hitter_recs[:num],
-            'pitchers': pitcher_recs[:num],
+            'hitters': hitter_recs,
+            'pitchers': pitcher_recs,
             'losing_categories': [a['name'] for a in losing],
         }
 
@@ -80,12 +99,15 @@ class Recommender:
         if hitters is None and pitchers is None:
             hitters, pitchers = self._split_free_agents()
 
-        hitter_recs = self._rank_for_categories(hitters, self._cats_with_zero_margin(self.batting_cats))
-        pitcher_recs = self._rank_for_categories(pitchers, self._cats_with_zero_margin(self.pitching_cats))
+        hitter_recs = self._rank_for_categories(hitters, self._cats_with_zero_margin(self.batting_cats))[:num]
+        pitcher_recs = self._rank_for_categories(pitchers, self._cats_with_zero_margin(self.pitching_cats))[:num]
+
+        self._attach_drop_info(hitter_recs, is_pitcher=False)
+        self._attach_drop_info(pitcher_recs, is_pitcher=True)
 
         return {
-            'hitters': hitter_recs[:num],
-            'pitchers': pitcher_recs[:num],
+            'hitters': hitter_recs,
+            'pitchers': pitcher_recs,
         }
 
     @staticmethod
@@ -123,6 +145,8 @@ class Recommender:
     def split_free_agents_fangraphs(self, bat_primary, bat_by_name, pit_primary, pit_by_name):
         hitters, pitchers = [], []
         for fa in self.free_agents:
+            if not self._is_available(fa):
+                continue
             if fa.position in ('SP', 'RP', 'P'):
                 proj = lookup_pitcher(fa.name, fa.proTeam, pit_primary, pit_by_name)
                 if proj:
@@ -140,6 +164,8 @@ class Recommender:
     def _split_free_agents(self):
         hitters, pitchers = [], []
         for fa in self.free_agents:
+            if not self._is_available(fa):
+                continue
             proj = fa.stats.get(0, {}).get('projected_breakdown', {})
             if not proj:
                 continue
@@ -228,6 +254,68 @@ class Recommender:
                     score += val
         return round(score, 2)
 
+    # ------------------------------------------------------------------
+    # Drop pairing — attach a suggested drop + category deltas to recs
+    # ------------------------------------------------------------------
+
+    def _get_drop_candidates_by_type(self):
+        """Return (hitter_drops, pitcher_drops) sorted weakest first (bench before starters)."""
+        if self._hitter_drops is not None:
+            return self._hitter_drops, self._pitcher_drops
+
+        hitter_drops, pitcher_drops = [], []
+        for player in self.roster:
+            proj = player.stats.get(0, {}).get('projected_breakdown', {})
+            value = self._composite_value(proj, self.categories)
+            injury = player.injuryStatus
+            if injury == 'ACTIVE':
+                injury = None
+
+            candidate = {
+                'player': player,
+                'value': value,
+                'proj': proj,
+                'lineup_slot': player.lineupSlot,
+                'is_bench': player.lineupSlot in ('BE', 'IL'),
+                'injury': injury,
+            }
+
+            if player.position in ('SP', 'RP', 'P'):
+                pitcher_drops.append(candidate)
+            else:
+                hitter_drops.append(candidate)
+
+        hitter_drops.sort(key=lambda c: (not c['is_bench'], c['value']))
+        pitcher_drops.sort(key=lambda c: (not c['is_bench'], c['value']))
+
+        self._hitter_drops = hitter_drops
+        self._pitcher_drops = pitcher_drops
+        return hitter_drops, pitcher_drops
+
+    def _attach_drop_info(self, recs, is_pitcher):
+        """Enrich each recommendation with the best drop candidate and per-category deltas."""
+        hitter_drops, pitcher_drops = self._get_drop_candidates_by_type()
+        drops = pitcher_drops if is_pitcher else hitter_drops
+        cats = self.pitching_cats if is_pitcher else self.batting_cats
+
+        if not drops:
+            return
+
+        best_drop = drops[0]
+        drop_proj = best_drop['proj']
+
+        for rec in recs:
+            add_proj = rec.get('proj', {})
+            deltas = {}
+            for cat in cats:
+                name = cat['name']
+                add_val = add_proj.get(name, 0) or 0
+                drop_val = drop_proj.get(name, 0) or 0
+                deltas[name] = round(add_val - drop_val, 4)
+
+            rec['drop'] = best_drop
+            rec['category_deltas'] = deltas
+
 
 def consensus_pickups(espn_hitters, espn_pitchers, fg_hitters, fg_pitchers, top_n=25):
     """Players appearing in the top *top_n* of both ESPN and FanGraphs lists."""
@@ -254,6 +342,8 @@ def _consensus_side(espn_list, fg_list, top_n):
             'score': round((er['score'] + fr['score']) / 2, 3),
             'proj': er['proj'],
             'proj_fg': fr['proj'],
+            'drop': er.get('drop'),
+            'category_deltas': er.get('category_deltas'),
         })
     rows.sort(key=lambda x: x['espn_rank'] + x['fg_rank'])
     return rows

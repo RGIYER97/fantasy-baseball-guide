@@ -32,6 +32,21 @@ def fmt(name, value):
     return str(value)
 
 
+def fmt_delta(name, value):
+    if value is None:
+        return ''
+    sign = '+' if value >= 0 else ''
+    if name in RATE_3DEC:
+        return f'{sign}{value:.3f}'
+    if name in RATE_2DEC:
+        return f'{sign}{value:.2f}'
+    if isinstance(value, float) and value == int(value):
+        return f'{sign}{int(value)}'
+    if isinstance(value, float):
+        return f'{sign}{value:.1f}'
+    return f'{sign}{value}'
+
+
 def section(title):
     print()
     print('=' * 64)
@@ -145,13 +160,30 @@ def show_season(season, categories, subtitle=''):
     _show_player_table('Pitcher', season['pitchers'], pit_cats)
 
 
+def _drop_header(recs):
+    """Return a formatted string describing the suggested drop, or None."""
+    drop_info = recs[0].get('drop') if recs else None
+    if not drop_info:
+        return None
+    dp = drop_info['player']
+    slot = 'bench' if drop_info['is_bench'] else drop_info['lineup_slot']
+    inj = f', {drop_info["injury"]}' if drop_info.get('injury') else ''
+    return f'{dp.name} ({dp.position}, {slot}{inj}, Value {drop_info["value"]:.1f})'
+
+
 def _show_player_table(label, recs, cat_names):
     if not recs:
         print(f'\n  No {label.lower()} recommendations.')
         return
 
     show_cats = cat_names[:7]
-    print(f'\n  Top {label} Pickups')
+
+    drop_str = _drop_header(recs)
+    if drop_str:
+        print(f'\n  Top {label} Pickups  →  drop: {drop_str}')
+    else:
+        print(f'\n  Top {label} Pickups')
+
     rows = []
     for i, rec in enumerate(recs, 1):
         p = rec['player']
@@ -161,6 +193,16 @@ def _show_player_table(label, recs, cat_names):
             row.append(fmt(c, proj.get(c)))
         row.append(rec['score'])
         rows.append(row)
+
+        deltas = rec.get('category_deltas')
+        if deltas:
+            delta_row = ['', '  swap Δ', '', '', '']
+            for c in show_cats:
+                d = deltas.get(c)
+                delta_row.append(fmt_delta(c, d) if d is not None else '')
+            delta_row.append('')
+            rows.append(delta_row)
+
     print(tabulate(rows, headers=['#', 'Player', 'Team', 'Pos', 'Own%'] + show_cats + ['Score'],
                    tablefmt='simple'))
 
@@ -186,7 +228,13 @@ def _show_consensus_table(label, recs, cat_names):
         print(f'\n  No overlapping {label.lower()} recommendations.')
         return
     show_cats = cat_names[:5]
-    print(f'\n  {label}s in both top lists (ESPN stats in table)')
+
+    drop_str = _drop_header(recs)
+    if drop_str:
+        print(f'\n  {label}s in both top lists  →  drop: {drop_str}')
+    else:
+        print(f'\n  {label}s in both top lists (ESPN stats in table)')
+
     rows = []
     for i, rec in enumerate(recs, 1):
         p = rec['player']
@@ -196,6 +244,15 @@ def _show_consensus_table(label, recs, cat_names):
         for c in show_cats:
             row.append(fmt(c, proj.get(c)))
         rows.append(row)
+
+        deltas = rec.get('category_deltas')
+        if deltas:
+            delta_row = ['', '  swap Δ', '', '', '', '', '', '']
+            for c in show_cats:
+                d = deltas.get(c)
+                delta_row.append(fmt_delta(c, d) if d is not None else '')
+            rows.append(delta_row)
+
     print(tabulate(rows, headers=['#', 'Player', 'Team', 'E#', 'FG#', 'ESPN△', 'FG△', 'Avg△'] + show_cats,
                    tablefmt='simple'))
 
