@@ -5,6 +5,7 @@ from tabulate import tabulate
 from league_client import LeagueClient
 from pybaseball_stats import build_fangraphs_lookups
 from recommender import Recommender, consensus_pickups
+from roster import eligible_display, positional_scarcity, set_league_slots
 
 RATE_3DEC = {'AVG', 'OBP', 'SLG', 'OPS', 'WHIP', 'OBA', 'OOBP'}
 RATE_2DEC = {'ERA', 'K/9', 'K/BB', 'PPA', 'FPCT', 'SV%', 'WPCT'}
@@ -95,29 +96,36 @@ def show_roster(roster, categories):
     bat_show = bat_cats[:7]
     pit_show = pit_cats[:7]
 
+    scarcity = positional_scarcity(roster)
+
     hitters, pitchers = [], []
     for p in roster:
         proj = p.stats.get(0, {}).get('projected_breakdown', {})
         inj = f' [{p.injuryStatus}]' if p.injuryStatus and p.injuryStatus != 'ACTIVE' else ''
+        elig = eligible_display(p)
         if p.position in ('SP', 'RP', 'P'):
-            row = [p.lineupSlot, p.name + inj, p.position, p.proTeam]
+            row = [p.lineupSlot, p.name + inj, elig, p.proTeam]
             for c in pit_show:
                 row.append(fmt(c, proj.get(c)))
             pitchers.append(row)
         else:
-            row = [p.lineupSlot, p.name + inj, p.position, p.proTeam]
+            row = [p.lineupSlot, p.name + inj, elig, p.proTeam]
             for c in bat_show:
                 row.append(fmt(c, proj.get(c)))
             hitters.append(row)
 
     if hitters:
         print('\n  Hitters')
-        print(tabulate(hitters, headers=['Slot', 'Player', 'Pos', 'Team'] + bat_show,
+        print(tabulate(hitters, headers=['Slot', 'Player', 'Eligible', 'Team'] + bat_show,
                        tablefmt='simple'))
     if pitchers:
         print('\n  Pitchers')
-        print(tabulate(pitchers, headers=['Slot', 'Player', 'Pos', 'Team'] + pit_show,
+        print(tabulate(pitchers, headers=['Slot', 'Player', 'Eligible', 'Team'] + pit_show,
                        tablefmt='simple'))
+
+    scarce = [slot for slot, cnt in scarcity.items() if cnt <= 1]
+    if scarce:
+        print(f'\n  ⚠  Thin positions (only 1 eligible player): {", ".join(sorted(scarce))}')
 
 
 def _proj_for_rec(rec):
@@ -125,6 +133,25 @@ def _proj_for_rec(rec):
         return rec['proj']
     p = rec['player']
     return p.stats.get(0, {}).get('projected_breakdown', {})
+
+
+def _show_move_plan(moves):
+    """Print a compact transaction plan showing each drop → add pair."""
+    if not moves:
+        return
+    n = len(moves)
+    print(f'\n  ── Recommended roster moves: {n} ──')
+    for i, move in enumerate(moves, 1):
+        drop = move['drop']
+        add_rec = move['add']
+        dp = drop['player']
+        ap = add_rec['player']
+        d_elig = drop.get('eligible', dp.position)
+        a_elig = add_rec.get('eligible', ap.position)
+        d_slot = 'bench' if drop['is_bench'] else drop['lineup_slot']
+        util_tag = '  [for UTIL]' if add_rec.get('for_util') else ''
+        print(f'    {i}. Drop {dp.name} ({d_elig}, {d_slot})'
+              f'  →  Add {ap.name} ({a_elig}, {ap.proTeam}){util_tag}')
 
 
 def show_weekly(weekly, categories, subtitle=''):
@@ -138,13 +165,17 @@ def show_weekly(weekly, categories, subtitle=''):
         print('\n  You are not losing any categories — no pickups needed this week!')
         return
 
+    proj_src = weekly.get('projection_source', 'season')
+    src_label = 'weekly (matchup period)' if proj_src == 'weekly' else 'full-season'
     print(f'\n  Targeting categories: {", ".join(losing)}')
+    print(f'  Projection basis:    {src_label}')
 
     bat_cats = [c['name'] for c in categories if c['is_batting']]
     pit_cats = [c['name'] for c in categories if c['is_pitching']]
 
     _show_player_table('Hitter', weekly['hitters'], bat_cats)
     _show_player_table('Pitcher', weekly['pitchers'], pit_cats)
+    _show_move_plan(weekly.get('moves', []))
 
 
 def show_season(season, categories, subtitle=''):
@@ -158,17 +189,19 @@ def show_season(season, categories, subtitle=''):
 
     _show_player_table('Hitter', season['hitters'], bat_cats)
     _show_player_table('Pitcher', season['pitchers'], pit_cats)
+    _show_move_plan(season.get('moves', []))
 
 
-def _drop_header(recs):
-    """Return a formatted string describing the suggested drop, or None."""
-    drop_info = recs[0].get('drop') if recs else None
+def _format_drop(drop_info, for_util=False):
+    """Return a compact string describing a single drop candidate."""
     if not drop_info:
-        return None
+        return '—'
     dp = drop_info['player']
     slot = 'bench' if drop_info['is_bench'] else drop_info['lineup_slot']
+    elig = drop_info.get('eligible', dp.position)
     inj = f', {drop_info["injury"]}' if drop_info.get('injury') else ''
-    return f'{dp.name} ({dp.position}, {slot}{inj}, Value {drop_info["value"]:.1f})'
+    util_tag = '  [add for UTIL]' if for_util else ''
+    return f'{dp.name} ({elig}, {slot}{inj}){util_tag}'
 
 
 def _show_player_table(label, recs, cat_names):
@@ -177,33 +210,34 @@ def _show_player_table(label, recs, cat_names):
         return
 
     show_cats = cat_names[:7]
-
-    drop_str = _drop_header(recs)
-    if drop_str:
-        print(f'\n  Top {label} Pickups  →  drop: {drop_str}')
-    else:
-        print(f'\n  Top {label} Pickups')
+    print(f'\n  Top {label} Pickups')
 
     rows = []
     for i, rec in enumerate(recs, 1):
         p = rec['player']
         proj = _proj_for_rec(rec)
-        row = [i, p.name, p.proTeam, p.position, f'{p.percent_owned:.0f}%']
+        elig = rec.get('eligible', p.position)
+        row = [i, p.name, p.proTeam, elig, f'{p.percent_owned:.0f}%']
         for c in show_cats:
             row.append(fmt(c, proj.get(c)))
         row.append(rec['score'])
         rows.append(row)
 
+        drop_info = rec.get('drop')
         deltas = rec.get('category_deltas')
-        if deltas:
-            delta_row = ['', '  swap Δ', '', '', '']
-            for c in show_cats:
-                d = deltas.get(c)
-                delta_row.append(fmt_delta(c, d) if d is not None else '')
-            delta_row.append('')
+        if drop_info or deltas:
+            drop_str = _format_drop(drop_info, for_util=rec.get('for_util', False))
+            delta_parts = []
+            if deltas:
+                for c in show_cats:
+                    d = deltas.get(c)
+                    delta_parts.append(fmt_delta(c, d) if d is not None else '')
+            else:
+                delta_parts = [''] * len(show_cats)
+            delta_row = ['', f'  → drop: {drop_str}', '', '', ''] + delta_parts + ['']
             rows.append(delta_row)
 
-    print(tabulate(rows, headers=['#', 'Player', 'Team', 'Pos', 'Own%'] + show_cats + ['Score'],
+    print(tabulate(rows, headers=['#', 'Player', 'Team', 'Eligible', 'Own%'] + show_cats + ['Score'],
                    tablefmt='simple'))
 
 
@@ -229,31 +263,34 @@ def _show_consensus_table(label, recs, cat_names):
         return
     show_cats = cat_names[:5]
 
-    drop_str = _drop_header(recs)
-    if drop_str:
-        print(f'\n  {label}s in both top lists  →  drop: {drop_str}')
-    else:
-        print(f'\n  {label}s in both top lists (ESPN stats in table)')
+    print(f'\n  {label}s in both top lists (ESPN stats in table)')
 
     rows = []
     for i, rec in enumerate(recs, 1):
         p = rec['player']
         proj = rec.get('proj') or _proj_for_rec(rec)
-        row = [i, p.name, p.proTeam, rec['espn_rank'], rec['fg_rank'], rec['espn_score'], rec['fg_score'],
+        elig = rec.get('eligible', p.position)
+        row = [i, p.name, elig, rec['espn_rank'], rec['fg_rank'], rec['espn_score'], rec['fg_score'],
                rec['score']]
         for c in show_cats:
             row.append(fmt(c, proj.get(c)))
         rows.append(row)
 
+        drop_info = rec.get('drop')
         deltas = rec.get('category_deltas')
-        if deltas:
-            delta_row = ['', '  swap Δ', '', '', '', '', '', '']
-            for c in show_cats:
-                d = deltas.get(c)
-                delta_row.append(fmt_delta(c, d) if d is not None else '')
+        if drop_info or deltas:
+            drop_str = _format_drop(drop_info, for_util=rec.get('for_util', False))
+            delta_parts = []
+            if deltas:
+                for c in show_cats:
+                    d = deltas.get(c)
+                    delta_parts.append(fmt_delta(c, d) if d is not None else '')
+            else:
+                delta_parts = [''] * len(show_cats)
+            delta_row = ['', f'  → drop: {drop_str}', '', '', '', '', '', ''] + delta_parts
             rows.append(delta_row)
 
-    print(tabulate(rows, headers=['#', 'Player', 'Team', 'E#', 'FG#', 'ESPN△', 'FG△', 'Avg△'] + show_cats,
+    print(tabulate(rows, headers=['#', 'Player', 'Eligible', 'E#', 'FG#', 'ESPN△', 'FG△', 'Avg△'] + show_cats,
                    tablefmt='simple'))
 
 
@@ -268,10 +305,13 @@ def show_drops(drops):
         p = c['player']
         status = 'BENCH' if c['is_bench'] else 'STARTER'
         inj = f'  ({c["injury"]})' if c['injury'] else ''
-        rows.append([p.name + inj, p.position, c['lineup_slot'], p.proTeam, status,
-                     f'{c["value"]:.1f}'])
-    print(tabulate(rows, headers=['Player', 'Pos', 'Slot', 'Team', 'Status', 'Value'],
+        elig = c.get('eligible', p.position)
+        scarce_tag = ' ⚠' if c.get('sole_eligible') else ''
+        rows.append([p.name + inj, elig, c['lineup_slot'], p.proTeam, status,
+                     f'{c["value"]:.1f}', scarce_tag])
+    print(tabulate(rows, headers=['Player', 'Eligible', 'Slot', 'Team', 'Status', 'Value', ''],
                    tablefmt='simple'))
+    print('  ⚠ = sole eligible player for a starting slot (risky to drop)')
 
 
 def parse_args():
@@ -327,14 +367,39 @@ def main():
     print(f'  Batting:    {", ".join(bat_names)}')
     print(f'  Pitching:   {", ".join(pit_names)}')
 
+    print('\n  Loading roster slot configuration …')
+    try:
+        league_slots = client.get_roster_slots()
+        set_league_slots(league_slots)
+        slot_summary = {}
+        for s in league_slots:
+            slot_summary[s] = slot_summary.get(s, 0) + 1
+        print(f'  Lineup:     {", ".join(f"{v}x{k}" if v > 1 else k for k, v in slot_summary.items())}')
+    except Exception as e:
+        print(f'  Could not load roster slots from API ({e}), inferring from roster.')
+
     matchup_info = client.get_matchup_info()
     matchup = client.get_current_matchup(team)
+    scoring_period = matchup_info.get('scoring_period') if matchup_info else None
 
     print('\n  Fetching free agents …')
     free_agents = client.get_free_agents(size=200)
+
+    weekly_free_agents = None
+    try:
+        print('  Fetching weekly projections …')
+        weekly_free_agents = client.get_free_agents_with_weekly_projections(size=200)
+    except Exception:
+        print('  Weekly projections not available, using season projections.')
+
     roster = team.roster
 
-    rec = Recommender(categories, matchup, roster, free_agents, stat_weights=stat_weights)
+    rec = Recommender(
+        categories, matchup, roster, free_agents,
+        stat_weights=stat_weights,
+        scoring_period=scoring_period,
+        weekly_free_agents=weekly_free_agents,
+    )
 
     fg_bat_p = fg_bat_bn = fg_pit_p = fg_pit_bn = None
     if args.source in ('all', 'fangraphs', 'both'):

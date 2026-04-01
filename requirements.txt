@@ -1,4 +1,7 @@
-espn_api
-pybaseball
-pandas
-tabulate
+# ESPN Fantasy Baseball + optional FanGraphs stats.
+# Python 3.10+ recommended (uses PEP 604 union types).
+
+espn_api>=0.44.0
+pybaseball>=2.0
+pandas>=2.0
+tabulate>=0.9.0

@@ -1,5 +1,8 @@
+import json
+
 from espn_api.baseball import League
-from espn_api.baseball.constant import STATS_MAP
+from espn_api.baseball.constant import POSITION_MAP, STATS_MAP
+from espn_api.baseball.player import Player
 
 BATTING_STATS = {
     'AB', 'H', 'AVG', '2B', '3B', 'HR', 'XBH', '1B', 'TB', 'SLG',
@@ -126,9 +129,77 @@ class LeagueClient:
                 }
         return None
 
+    def get_roster_slots(self):
+        """Return the league's required lineup slots from ESPN settings.
+
+        Returns a list of slot name strings with duplicates for positions
+        that have multiple slots (e.g. three 'OF' entries).
+        Bench and IL slots are excluded.
+        """
+        params = {'view': 'mSettings'}
+        data = self.league.espn_request.league_get(params=params)
+        slot_counts = (
+            data.get('settings', {})
+            .get('rosterSettings', {})
+            .get('lineupSlotCounts', {})
+        )
+
+        bench_ids = {
+            POSITION_MAP.get('BE', 16),
+            POSITION_MAP.get('IL', 17),
+        }
+        slots = []
+        for slot_id_str, count in slot_counts.items():
+            slot_id = int(slot_id_str)
+            if count <= 0 or slot_id in bench_ids:
+                continue
+            slot_name = POSITION_MAP.get(slot_id, f'SLOT_{slot_id}')
+            slots.extend([slot_name] * count)
+        return slots
+
     def get_free_agents(self, size=150):
         """Return top free agents sorted by ownership percentage."""
         return self.league.free_agents(size=size)
+
+    def get_free_agents_with_weekly_projections(self, size=150):
+        """Fetch free agents with current-scoring-period projected stats.
+
+        ESPN's kona_player_info view can be filtered to include stat
+        projections for specific scoring periods via x-fantasy-filter.
+        Falls back to the normal fetch if the extra data isn't available.
+        """
+        week = self.league.current_week
+        year = self.league.year
+
+        params = {
+            'view': 'kona_player_info',
+            'scoringPeriodId': week,
+        }
+        filters = {
+            'players': {
+                'filterStatus': {'value': ['FREEAGENT', 'WAIVERS']},
+                'limit': size,
+                'sortPercOwned': {'sortPriority': 1, 'sortAsc': False},
+                'sortDraftRanks': {
+                    'sortPriority': 100,
+                    'sortAsc': True,
+                    'value': 'STANDARD',
+                },
+                'filterStatsForCurrentMatchupPeriod': {
+                    'value': True,
+                },
+            },
+        }
+        headers = {'x-fantasy-filter': json.dumps(filters)}
+
+        try:
+            data = self.league.espn_request.league_get(
+                params=params, headers=headers,
+            )
+            players = data.get('players', [])
+            return [Player(p, year) for p in players]
+        except Exception:
+            return self.league.free_agents(size=size)
 
     def get_matchup_info(self):
         """Return metadata about the current matchup period."""
