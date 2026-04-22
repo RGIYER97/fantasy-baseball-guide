@@ -1,4 +1,4 @@
-from pybaseball_stats import lookup_batter, lookup_pitcher
+from pybaseball_stats import lookup_batter, lookup_pitcher, normalize_name
 from roster import (
     find_best_drop,
     eligible_display,
@@ -18,7 +18,9 @@ INJURED_STATUSES = frozenset({
 class Recommender:
     def __init__(self, categories, matchup, roster, free_agents,
                  stat_weights=None, scoring_period=None,
-                 weekly_free_agents=None):
+                 weekly_free_agents=None,
+                 starts_remaining=None, team_games_remaining=None,
+                 days_remaining=None):
         self.categories = categories
         self.matchup = matchup
         self.roster = roster
@@ -30,6 +32,10 @@ class Recommender:
         self.pitching_cats = [c for c in categories if c['is_pitching']]
         self._hitter_drops = None
         self._pitcher_drops = None
+        # Schedule context — sourced from MLB Stats API
+        self.starts_remaining = starts_remaining or {}      # normalized_name → int
+        self.team_games_remaining = team_games_remaining or {}  # team_abbr → int
+        self.days_remaining = days_remaining  # int or None
 
     @staticmethod
     def _is_available(player):
@@ -104,6 +110,11 @@ class Recommender:
         hitter_recs = self._rank_for_categories(hitters, losing_bat)[:extra]
         pitcher_recs = self._rank_for_categories(pitchers, losing_pit)[:extra]
 
+        # Apply schedule weights — boosts players with more starts/games remaining
+        # and excludes pitchers with confirmed 0 starts left this period.
+        hitter_recs = self._apply_schedule_weights(hitter_recs, is_pitcher=False)
+        pitcher_recs = self._apply_schedule_weights(pitcher_recs, is_pitcher=True)
+
         used_drops: set = set()
         self._attach_drop_info(hitter_recs, is_pitcher=False, used_drops=used_drops,
                                target_cats=target_names)
@@ -122,6 +133,57 @@ class Recommender:
             'projection_source': projection_source,
             'moves': moves,
         }
+
+    # ------------------------------------------------------------------
+    # Schedule weighting — uses MLB Stats API context
+    # ------------------------------------------------------------------
+
+    def _apply_schedule_weights(self, recs: list, is_pitcher: bool) -> list:
+        """Re-weight and filter recommendations by starts/games remaining.
+
+        Pitchers with 0 confirmed starts this period are excluded entirely.
+        Pitchers with multiple starts get a proportional score boost.
+        Hitters on teams playing more games get a proportional boost.
+
+        Players absent from the schedule dict have unknown scheduling
+        (probable not yet announced) and are kept at their base score.
+        """
+        if not recs:
+            return recs
+
+        # Scale factor uses 1.5 expected starts/week and 4 expected games/week
+        # as neutral baselines so a player at the baseline scores no differently.
+        START_BASELINE = 1.5
+        GAME_BASELINE  = 4.0
+
+        adjusted = []
+        for rec in recs:
+            fa = rec['player']
+            nn = normalize_name(fa.name)
+
+            if is_pitcher and self.starts_remaining:
+                starts = self.starts_remaining.get(nn, -1)
+                rec['starts_remaining'] = starts
+                if starts == 0:
+                    continue  # confirmed no starts — exclude from weekly
+                if starts > 0:
+                    factor = max(0.4, min(2.5, starts / START_BASELINE))
+                    rec['score'] = round(rec['score'] * factor, 3)
+
+            if not is_pitcher and self.team_games_remaining:
+                team = str(getattr(fa, 'proTeam', '') or '').upper().strip()
+                games = self.team_games_remaining.get(team, -1)
+                rec['games_remaining'] = games
+                if games == 0:
+                    continue  # team has no games — exclude
+                if games > 0:
+                    factor = max(0.3, min(2.0, games / GAME_BASELINE))
+                    rec['score'] = round(rec['score'] * factor, 3)
+
+            adjusted.append(rec)
+
+        adjusted.sort(key=lambda x: x['score'], reverse=True)
+        return adjusted
 
     # ------------------------------------------------------------------
     # Season recommendations — overall value across ALL categories

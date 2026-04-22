@@ -206,7 +206,30 @@ class LeagueClient:
         matchup_map = self.league.settings.matchup_periods
         current_mp = self.league.currentMatchupPeriod
         current_sp = self.league.scoringPeriodId
+
+        # Primary lookup by currentMatchupPeriod key
         periods = matchup_map.get(str(current_mp), [])
+
+        # ESPN sometimes advances currentMatchupPeriod before the period
+        # actually ends, so current_sp may not be in the fetched periods.
+        # Fall back to searching every matchup period for current_sp.
+        if not periods or current_sp not in periods:
+            for mp_periods in matchup_map.values():
+                if isinstance(mp_periods, list) and current_sp in mp_periods:
+                    periods = mp_periods
+                    break
+
+        # Second fallback: scoringPeriodId sometimes advances past the last
+        # period ID at midnight. Accept the period whose max is current_sp - 1.
+        if (not periods or current_sp not in periods) and matchup_map:
+            for mp_periods in matchup_map.values():
+                if (isinstance(mp_periods, list) and mp_periods
+                        and max(mp_periods) == current_sp - 1):
+                    periods = mp_periods
+                    # Treat the final period as still active today
+                    current_sp = max(mp_periods)
+                    break
+
         remaining = [p for p in periods if p >= current_sp]
         return {
             'matchup_period': current_mp,
