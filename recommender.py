@@ -84,6 +84,111 @@ class Recommender:
         return analysis
 
     # ------------------------------------------------------------------
+    # Projected week-end outcome
+    # ------------------------------------------------------------------
+
+    def project_week_end(self, opp_roster):
+        """Estimate projected end-of-week category totals for both rosters.
+
+        Counting stats: current + (per-game rate × games/starts remaining).
+        Rate stats: current value only — can't project without underlying counts.
+        Returns [] when schedule context is unavailable.
+        """
+        if not self.matchup or (not self.team_games_remaining and not self.starts_remaining):
+            return []
+
+        my_rem  = self._project_team_remaining(self.roster)
+        opp_rem = self._project_team_remaining(opp_roster)
+
+        my_stats  = self.matchup['my_stats']  or {}
+        opp_stats = self.matchup['opp_stats'] or {}
+
+        results = []
+        for cat in self.categories:
+            name = cat['name']
+            my_cur  = (my_stats.get(name)  or {}).get('value', 0) or 0
+            opp_cur = (opp_stats.get(name) or {}).get('value', 0) or 0
+
+            if cat['is_rate']:
+                my_proj = my_cur
+                opp_proj = opp_cur
+                my_r = opp_r = None
+            else:
+                my_r  = my_rem.get(name,  0)
+                opp_r = opp_rem.get(name, 0)
+                my_proj  = my_cur  + my_r
+                opp_proj = opp_cur + opp_r
+
+            margin = (opp_proj - my_proj) if cat['is_inverse'] else (my_proj - opp_proj)
+            results.append({
+                'name': name,
+                'is_rate': cat['is_rate'],
+                'is_inverse': cat['is_inverse'],
+                'is_batting': cat['is_batting'],
+                'is_pitching': cat['is_pitching'],
+                'my_current':    my_cur,
+                'my_remaining':  my_r,
+                'my_projected':  my_proj,
+                'opp_current':   opp_cur,
+                'opp_remaining': opp_r,
+                'opp_projected': opp_proj,
+                'projected_result': 'WIN' if margin > 0 else ('LOSS' if margin < 0 else 'PUSH'),
+            })
+        return results
+
+    def _project_team_remaining(self, roster) -> dict:
+        totals: dict = {}
+        long_term_il = frozenset({'SIXTY_DAY_DL', 'INJURED_RESERVE'})
+        for player in roster:
+            if getattr(player, 'injuryStatus', None) in long_term_il:
+                continue
+            proj = (player.stats.get(0) or {}).get('projected_breakdown') or {}
+            if not proj:
+                continue
+            if is_pitcher_player(player):
+                self._acc_pitcher_remaining(player, proj, totals)
+            else:
+                self._acc_hitter_remaining(player, proj, totals)
+        return totals
+
+    def _acc_hitter_remaining(self, player, proj, totals) -> None:
+        team = str(getattr(player, 'proTeam', '') or '').upper().strip()
+        games_rem = self.team_games_remaining.get(team, 0)
+        if not games_rem:
+            return
+        season_g = proj.get('G') or 162
+        for cat in self.batting_cats:
+            if cat['is_rate']:
+                continue
+            val = proj.get(cat['name']) or 0
+            totals[cat['name']] = totals.get(cat['name'], 0.0) + (val / season_g) * games_rem
+
+    def _acc_pitcher_remaining(self, player, proj, totals) -> None:
+        if player.position in ('SP', 'P'):
+            nn = normalize_name(player.name)
+            starts_rem = self.starts_remaining.get(nn, 0)
+            if not starts_rem:
+                return
+            season_gs = proj.get('GS') or 1
+            for cat in self.pitching_cats:
+                if cat['is_rate']:
+                    continue
+                val = proj.get(cat['name']) or 0
+                totals[cat['name']] = totals.get(cat['name'], 0.0) + (val / season_gs) * starts_rem
+        else:
+            # RP: scale by team games remaining × per-game appearance rate
+            team = str(getattr(player, 'proTeam', '') or '').upper().strip()
+            games_rem = self.team_games_remaining.get(team, 0)
+            if not games_rem:
+                return
+            season_g = proj.get('GP') or proj.get('G') or 1
+            for cat in self.pitching_cats:
+                if cat['is_rate']:
+                    continue
+                val = proj.get(cat['name']) or 0
+                totals[cat['name']] = totals.get(cat['name'], 0.0) + (val / season_g) * games_rem
+
+    # ------------------------------------------------------------------
     # Weekly recommendations — focus on flipping losing categories
     # ------------------------------------------------------------------
 

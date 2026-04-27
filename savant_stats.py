@@ -38,6 +38,7 @@ _HEADERS = {
 
 _BAT_XWOBA_THRESHOLD = 0.020   # xwOBA − wOBA
 _PIT_XERA_THRESHOLD  = 0.50    # ERA − xERA (absolute)
+_PIT_ERA_MAX         = 15.0    # above this ERA is a small-sample artifact, not a signal
 
 
 def _safe_str(val: object) -> str:
@@ -220,7 +221,8 @@ def get_savant_signals(
         nn = normalize_name(fa.name)
         if fa.position in ('SP', 'RP', 'P'):
             d = pit_lookup.get(nn)
-            if d and d['xera_diff'] > _PIT_XERA_THRESHOLD and d['xERA'] > 0:
+            if (d and d['xera_diff'] > _PIT_XERA_THRESHOLD
+                    and d['xERA'] > 0 and d['ERA'] <= _PIT_ERA_MAX):
                 fa_buy_pit.append({'player': fa, **d})
         else:
             d = bat_lookup.get(nn)
