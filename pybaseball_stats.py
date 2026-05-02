@@ -258,6 +258,31 @@ def build_fangraphs_lookups(year: int) -> Tuple[Dict[Tuple[str, str], Dict[str, 
     return bat_primary, bat_by_name, pit_primary, pit_by_name
 
 
+def _fuzzy_name_lookup(
+    nn: str,
+    by_name: Mapping[str, List[Tuple[str, Dict[str, float]]]],
+    threshold: float = 90.0,
+) -> Optional[Dict[str, float]]:
+    """Fuzzy fallback when exact normalize-and-match fails.
+
+    Uses rapidfuzz WRatio so common differences (punctuation, middle initials,
+    apostrophes already stripped by normalize_name) still resolve. Returns None
+    when rapidfuzz is not installed or no candidate exceeds the threshold.
+    """
+    try:
+        from rapidfuzz import process, fuzz  # type: ignore
+    except ImportError:
+        return None
+    keys = list(by_name.keys())
+    if not keys:
+        return None
+    result = process.extractOne(nn, keys, scorer=fuzz.WRatio, score_cutoff=threshold)
+    if result is None:
+        return None
+    entries = by_name[result[0]]
+    return dict(entries[0][1])
+
+
 def lookup_batter(
     espn_name: str,
     espn_team: Any,
@@ -276,7 +301,7 @@ def lookup_batter(
     for t, proj in cands:
         if t == team:
             return dict(proj)
-    return None
+    return _fuzzy_name_lookup(nn, by_name)
 
 
 def lookup_pitcher(

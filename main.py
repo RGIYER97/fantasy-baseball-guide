@@ -401,12 +401,16 @@ def show_savant_signals(signals):
         rows = []
         for s in sell_pit:
             p = s['player']
+            starts = s.get('starts', -1)
+            starts_str = '?' if starts == -1 else str(starts)
+            note = ' ← hold this week' if starts >= 2 else ''
             rows.append([
-                p.name, p.proTeam,
+                p.name, p.proTeam, starts_str,
                 f'{s["ERA"]:.2f}', f'{s["xERA"]:.2f}', f'{s["xera_diff"]:.2f}',
+                note,
             ])
         print(tabulate(rows,
-                       headers=['Player', 'Team', 'ERA', 'xERA', 'Δ(ERA-xERA)'],
+                       headers=['Player', 'Team', 'Starts', 'ERA', 'xERA', 'Δ(ERA-xERA)', ''],
                        tablefmt='simple'))
     else:
         print('  None above threshold.')
@@ -630,17 +634,66 @@ def show_drops(drops):
     print('  ⚠ = sole eligible player for a starting slot (risky to drop)')
 
 
+def show_closer_targets(targets, categories):
+    section('Closer Targets  (save-role verified by SV pace)')
+    cat_names = {c['name'] for c in categories}
+    has_ros = any(r.get('ros_sv') is not None for r in targets)
+
+    rows = []
+    for i, rec in enumerate(targets, 1):
+        p = rec['player']
+        proj = rec['proj']
+        pace_str = f"{rec['sv_pace']:.2f}/G"
+        row = [i, p.name, p.proTeam, rec['eligible'],
+               f'{p.percent_owned:.0f}%',
+               fmt('SV', rec['sv_ytd']), pace_str]
+        if has_ros:
+            ros = rec.get('ros_sv')
+            row.append(fmt('SV', ros) if ros is not None else '?')
+        for c in ('ERA', 'WHIP', 'K/9'):
+            if c in cat_names:
+                row.append(fmt(c, proj.get(c)))
+        rows.append(row)
+
+    headers = ['#', 'Player', 'Team', 'Eligible', 'Own%', 'YTD SV', 'SV/G']
+    if has_ros:
+        headers.append('ROS SV')
+    for c in ('ERA', 'WHIP', 'K/9'):
+        if c in cat_names:
+            headers.append(c)
+    print(tabulate(rows, headers=headers, tablefmt='simple'))
+    print('\n  Ranked by SV pace + ROS projection. Add to target losing SV/SVHD/HLD.')
+
+
+def show_streaming_queue(queue):
+    section('Streaming Queue  (FA starters with 2+ starts this week)')
+    rows = []
+    for i, rec in enumerate(queue, 1):
+        p = rec['player']
+        proj = rec['proj']
+        starts = rec['starts_remaining']
+        rows.append([
+            i, p.name, p.proTeam, rec.get('eligible', p.position),
+            f'{p.percent_owned:.0f}%', str(starts),
+            fmt('ERA',  proj.get('ERA')),
+            fmt('WHIP', proj.get('WHIP')),
+            fmt('K/9',  proj.get('K/9')),
+            fmt('K',    proj.get('K')),
+        ])
+    print(tabulate(rows,
+                   headers=['#', 'Player', 'Team', 'Elig', 'Own%', 'Starts',
+                             'ERA', 'WHIP', 'K/9', 'K'],
+                   tablefmt='simple'))
+    print('\n  Sorted: most starts first, then quality. Schedule-based — ignores category gaps.')
+
+
 def parse_args():
     p = argparse.ArgumentParser(description='ESPN H2H Categories helper with optional FanGraphs (pybaseball) stats.')
     p.add_argument(
         '--source',
-        choices=('all', 'espn', 'fangraphs', 'steamer', 'both'),
+        choices=('all', 'espn', 'fangraphs', 'steamer'),
         default='all',
-        help=(
-            'all: ESPN + FanGraphs + Steamer ROS + overlaps | '
-            'espn | fangraphs | steamer | '
-            'both: ESPN∩FanGraphs overlap only'
-        ),
+        help='all: ESPN + FanGraphs + Steamer ROS + overlaps | espn | fangraphs | steamer',
     )
     p.add_argument(
         '--proj-system',
@@ -648,12 +701,6 @@ def parse_args():
         default='steamer',
         dest='proj_system',
         help='Projection system to use with --source steamer/all (default: steamer)',
-    )
-    p.add_argument(
-        '--no-savant',
-        action='store_true',
-        dest='no_savant',
-        help='Skip Baseball Savant xStats signals only (useful if Savant is unreachable)',
     )
     p.add_argument(
         '--scout',
@@ -794,7 +841,7 @@ def main():
 
     _fg_hit = None
     fg_bat_p = fg_bat_bn = fg_pit_p = fg_pit_bn = None
-    if args.source in ('all', 'fangraphs', 'both'):
+    if args.source in ('all', 'fangraphs'):
         print(f'\n  Loading FanGraphs leader stats via pybaseball (MLB season {fg_year}) …')
         try:
             _ck = f'fg_leaders_{fg_year}'
@@ -806,7 +853,7 @@ def main():
                 cache_set(_ck, (fg_bat_p, fg_bat_bn, fg_pit_p, fg_pit_bn))
         except Exception as e:
             print(f'  FanGraphs load failed: {e}')
-            if args.source in ('fangraphs', 'both'):
+            if args.source == 'fangraphs':
                 sys.exit(2)
             fg_bat_p = fg_bat_bn = fg_pit_p = fg_pit_bn = None
 
@@ -845,7 +892,7 @@ def main():
 
     # ── Baseball Savant xStats ─────────────────────────────────────────────
     savant_bat = savant_pit = None
-    if args.source == 'all' and not args.no_savant:
+    if args.source == 'all':
         print('\n  Loading Baseball Savant xStats …')
         try:
             _ck = f'savant_{fg_year}'
@@ -913,9 +960,9 @@ def main():
 
     weekly_espn = weekly_fg = weekly_st = weekly_recent = None
     if analysis:
-        if args.source in ('all', 'espn', 'both'):
+        if args.source in ('all', 'espn'):
             weekly_espn = rec.get_weekly_recommendations(analysis)
-        if args.source in ('all', 'fangraphs', 'both') and fg_h is not None:
+        if args.source in ('all', 'fangraphs') and fg_h is not None:
             weekly_fg = rec.get_weekly_recommendations(analysis, hitters=fg_h, pitchers=fg_p)
         if args.source in ('all', 'steamer') and st_h is not None:
             weekly_st = rec.get_weekly_recommendations(analysis, hitters=st_h, pitchers=st_p)
@@ -924,16 +971,19 @@ def main():
                 analysis, hitters=recent_h, pitchers=recent_p)
 
     season_espn = season_fg = season_st = None
-    if args.source in ('all', 'espn', 'both'):
+    if args.source in ('all', 'espn'):
         season_espn = rec.get_season_recommendations()
-    if args.source in ('all', 'fangraphs', 'both') and fg_h is not None:
+    if args.source in ('all', 'fangraphs') and fg_h is not None:
         season_fg = rec.get_season_recommendations(hitters=fg_h, pitchers=fg_p)
     if args.source in ('all', 'steamer') and st_h is not None:
         season_st = rec.get_season_recommendations(hitters=st_h, pitchers=st_p)
 
     savant_signals = None
     if savant_bat is not None:
-        savant_signals = get_savant_signals(free_agents, roster, savant_bat, savant_pit)
+        savant_signals = get_savant_signals(
+            free_agents, roster, savant_bat, savant_pit,
+            starts_remaining=starts_remaining,
+        )
 
     # ── Display ────────────────────────────────────────────────────────────
     weekly_sources = [
@@ -942,7 +992,6 @@ def main():
         ('Steamer', weekly_st),
         ('L14',    weekly_recent),
     ]
-    show_summary(analysis, matchup, proj_outcome, opp_name, weekly_sources, savant_signals)
 
     show_roster(roster, categories)
 
@@ -983,7 +1032,7 @@ def main():
             show_weekly(weekly_recent, categories, 'Recent Form — last 14 days (FanGraphs)',
                         days_remaining=days_remaining)
 
-        if args.source in ('all', 'both') and weekly_espn and weekly_fg:
+        if args.source == 'all' and weekly_espn and weekly_fg:
             ch, cp = consensus_pickups(
                 weekly_espn['hitters'], weekly_espn['pitchers'],
                 weekly_fg['hitters'], weekly_fg['pitchers'],
@@ -1000,6 +1049,21 @@ def main():
                 show_consensus_weekly(ch, cp, categories,
                                       title=f'ESPN ∩ {proj_label} ROS (both top lists)')
 
+    # Streaming queue — schedule-based; show whenever starts data is available
+    streaming_queue = rec.get_streaming_queue(
+        pitchers=st_p if st_p is not None else fg_p
+    )
+    if streaming_queue:
+        show_streaming_queue(streaming_queue)
+
+    # Closer targets — only fires when SV/SVHD/HLD is a losing category
+    if analysis:
+        closer_targets = rec.get_closer_targets(
+            analysis, ytd_pitchers=fg_p, ros_pitchers=st_p
+        )
+        if closer_targets:
+            show_closer_targets(closer_targets, categories)
+
     show_drops(rec.get_drop_candidates())
 
     if args.source in ('all', 'espn') and _has_recs(season_espn):
@@ -1009,7 +1073,7 @@ def main():
     if args.source in ('all', 'steamer') and _has_recs(season_st):
         show_season(season_st, categories, f'{proj_label} ROS projections')
 
-    if args.source in ('all', 'both') and season_espn and season_fg:
+    if args.source == 'all' and season_espn and season_fg:
         sh, sp = consensus_pickups(
             season_espn['hitters'], season_espn['pitchers'],
             season_fg['hitters'], season_fg['pitchers'],
@@ -1031,6 +1095,8 @@ def main():
 
     if savant_signals is not None:
         show_savant_signals(savant_signals)
+
+    show_summary(analysis, matchup, proj_outcome, opp_name, weekly_sources, savant_signals)
 
     print()
 

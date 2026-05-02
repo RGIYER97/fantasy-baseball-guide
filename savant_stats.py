@@ -207,41 +207,62 @@ def build_savant_lookups(year: int) -> Tuple[Dict[str, dict], Dict[str, dict]]:
     return bat_lookup, pit_lookup
 
 
+def _fuzzy_lookup_savant(nn: str, lookup: Dict[str, dict], threshold: float = 90.0) -> Optional[dict]:
+    """Fuzzy name fallback for Savant dicts keyed by normalized name."""
+    try:
+        from rapidfuzz import process, fuzz  # type: ignore
+    except ImportError:
+        return None
+    keys = list(lookup.keys())
+    if not keys:
+        return None
+    result = process.extractOne(nn, keys, scorer=fuzz.WRatio, score_cutoff=threshold)
+    return lookup[result[0]] if result is not None else None
+
+
 def get_savant_signals(
     free_agents,
     roster,
     bat_lookup: Dict[str, dict],
     pit_lookup: Dict[str, dict],
+    starts_remaining: Optional[Dict[str, int]] = None,
     top_n: int = 8,
 ) -> dict:
-    """Classify players into buy-low / sell-high groups."""
+    """Classify players into buy-low / sell-high groups.
+
+    starts_remaining : {normalized_name: starts_this_week} from the MLB schedule API.
+    Sell-high pitcher entries include a 'starts' key so the display layer can flag
+    pitchers who are still worth starting this week despite the regression signal.
+    """
     fa_buy_hit: List[dict] = []
     fa_buy_pit: List[dict] = []
     for fa in free_agents:
         nn = normalize_name(fa.name)
         if fa.position in ('SP', 'RP', 'P'):
-            d = pit_lookup.get(nn)
+            d = pit_lookup.get(nn) or _fuzzy_lookup_savant(nn, pit_lookup)
             if (d and d['xera_diff'] > _PIT_XERA_THRESHOLD
                     and d['xERA'] > 0 and d['ERA'] <= _PIT_ERA_MAX):
                 fa_buy_pit.append({'player': fa, **d})
         else:
-            d = bat_lookup.get(nn)
+            d = bat_lookup.get(nn) or _fuzzy_lookup_savant(nn, bat_lookup)
             if d and d['xwoba_diff'] > _BAT_XWOBA_THRESHOLD and d['xwOBA'] > 0:
                 fa_buy_hit.append({'player': fa, **d})
 
     fa_buy_hit.sort(key=lambda x: x['xwoba_diff'], reverse=True)
     fa_buy_pit.sort(key=lambda x: x['xera_diff'],  reverse=True)
 
+    sr = starts_remaining or {}
     roster_sell_hit: List[dict] = []
     roster_sell_pit: List[dict] = []
     for p in roster:
         nn = normalize_name(p.name)
         if p.position in ('SP', 'RP', 'P'):
-            d = pit_lookup.get(nn)
+            d = pit_lookup.get(nn) or _fuzzy_lookup_savant(nn, pit_lookup)
             if d and d['xera_diff'] < -_PIT_XERA_THRESHOLD and d['ERA'] > 0:
-                roster_sell_pit.append({'player': p, **d})
+                starts = sr.get(nn, -1)  # -1 = probable not yet announced
+                roster_sell_pit.append({'player': p, 'starts': starts, **d})
         else:
-            d = bat_lookup.get(nn)
+            d = bat_lookup.get(nn) or _fuzzy_lookup_savant(nn, bat_lookup)
             if d and d['xwoba_diff'] < -_BAT_XWOBA_THRESHOLD and d['wOBA'] > 0:
                 roster_sell_hit.append({'player': p, **d})
 

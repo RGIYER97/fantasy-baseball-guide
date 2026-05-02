@@ -14,6 +14,22 @@ INJURED_STATUSES = frozenset({
     'INJURED_RESERVE', 'PATERNITY', 'BEREAVEMENT',
 })
 
+# Categories driven by the same underlying skill. When a player helps ≥2 from
+# a group, the combined effect exceeds independent scoring — add a bonus.
+_CORR_GROUPS = (
+    frozenset({'ERA', 'WHIP', 'OBA'}),
+    frozenset({'K', 'K/9', 'K/BB'}),
+    frozenset({'AVG', 'OBP', 'OPS', 'SLG'}),
+    frozenset({'SV', 'SVHD'}),
+    frozenset({'HLD', 'SVHD'}),
+    frozenset({'R', 'RBI'}),
+)
+_CORR_BONUS = 0.15   # fraction of grouped contribution added per extra correlated cat
+
+_SAVE_CATS = frozenset({'SV', 'SVHD', 'HLD'})
+_CLOSER_PACE_MIN = 0.10   # SV/game — rough closer threshold (~16+ saves pace)
+_CLOSER_SV_MIN   = 5      # absolute YTD saves as alternative qualifier
+
 
 class Recommender:
     def __init__(self, categories, matchup, roster, free_agents,
@@ -324,6 +340,115 @@ class Recommender:
             'moves': moves,
         }
 
+    # ------------------------------------------------------------------
+    # Closer targets — save-role FA relievers
+    # ------------------------------------------------------------------
+
+    def get_closer_targets(self, analysis, ytd_pitchers=None, ros_pitchers=None, num=8):
+        """Return FA relievers with a confirmed save role, ranked by SV upside.
+
+        Only runs when SV, SVHD, or HLD appears in the losing categories.
+
+        ytd_pitchers : (fa, proj) list from FanGraphs YTD — supplies real SV pace.
+        ros_pitchers : (fa, proj) list from Steamer ROS — supplies projected SVs.
+        When neither is supplied the ESPN FA pool is used for pace calculation.
+        """
+        losing_names = {a['name'] for a in analysis if a['result'] == 'LOSS'}
+        if not (losing_names & _SAVE_CATS):
+            return []
+
+        # Build ROS save lookup by playerId
+        ros_by_id: dict = {}
+        if ros_pitchers:
+            for fa, proj in ros_pitchers:
+                pid = getattr(fa, 'playerId', id(fa))
+                ros_by_id[pid] = float(proj.get('SV', 0) or 0)
+
+        pool = ytd_pitchers
+        if not pool:
+            _, pool = self._split_free_agents()
+
+        results = []
+        for fa, proj in pool:
+            if fa.position not in ('RP', 'P'):
+                continue
+            sv_ytd  = float(proj.get('SV', 0) or 0)
+            g_ytd   = float(proj.get('G',  1) or 1)
+            sv_pace = sv_ytd / g_ytd
+
+            pid    = getattr(fa, 'playerId', id(fa))
+            ros_sv = ros_by_id.get(pid)
+
+            qualifies = (sv_pace >= _CLOSER_PACE_MIN
+                         or sv_ytd >= _CLOSER_SV_MIN
+                         or (ros_sv is not None and ros_sv >= 2))
+            if not qualifies:
+                continue
+
+            # Blend pace signal (backward-looking) with ROS projection (forward)
+            pace_score = sv_pace * 10
+            if ros_sv is not None:
+                score = pace_score * 0.6 + (ros_sv / 10.0) * 0.4
+            else:
+                score = pace_score
+
+            results.append({
+                'player':   fa,
+                'score':    round(score, 3),
+                'proj':     dict(proj),
+                'sv_pace':  round(sv_pace, 3),
+                'sv_ytd':   sv_ytd,
+                'ros_sv':   ros_sv,
+                'eligible': eligible_display(fa),
+            })
+
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results[:num]
+
+    # ------------------------------------------------------------------
+    # Streaming queue — FA starters with multiple starts this week
+    # ------------------------------------------------------------------
+
+    def get_streaming_queue(self, pitchers=None, num=8):
+        """FA starters with ≥2 starts remaining, ranked starts-first then quality.
+
+        pitchers : (fa, proj) list from FG or Steamer. Falls back to ESPN SP pool.
+        Returns [] when starts_remaining data is unavailable.
+        """
+        if not self.starts_remaining:
+            return []
+
+        if pitchers is None:
+            _, pitchers = self._split_free_agents()
+
+        streaming_pool = []
+        for fa, proj in pitchers:
+            if fa.position not in ('SP', 'P'):
+                continue
+            nn = normalize_name(fa.name)
+            starts = self.starts_remaining.get(nn, -1)
+            if starts < 2:
+                continue
+            streaming_pool.append((fa, proj, starts))
+
+        if not streaming_pool:
+            return []
+
+        pit_cats_z = self._cats_with_zero_margin(self.pitching_cats)
+        scored = self._rank_for_categories(
+            [(fa, proj) for fa, proj, _ in streaming_pool],
+            pit_cats_z,
+        )
+
+        starts_map = {normalize_name(fa.name): s for fa, _, s in streaming_pool}
+        for rec in scored:
+            nn = normalize_name(rec['player'].name)
+            rec['starts_remaining'] = starts_map.get(nn, -1)
+            rec['eligible'] = eligible_display(rec['player'])
+
+        scored.sort(key=lambda x: (-x['starts_remaining'], -x['score']))
+        return scored[:num]
+
     @staticmethod
     def _cats_with_zero_margin(cats):
         return [{**c, 'margin': 0} for c in cats]
@@ -449,6 +574,8 @@ class Recommender:
             score = 0.0
             key_stats = {}
             full_proj = dict(proj)
+            cat_contribs: dict = {}
+
             for cat in target_cats:
                 name = cat['name']
                 val = proj.get(name)
@@ -466,7 +593,18 @@ class Recommender:
                 matchup_w = 1.0 / (1.0 + margin * 0.05)
                 league_w = float(self.stat_weights.get(name, 1.0))
 
-                score += norm * matchup_w * league_w
+                contrib = norm * matchup_w * league_w
+                cat_contribs[name] = contrib
+                score += contrib
+
+            # Correlation bonus: categories driven by the same underlying skill
+            # are worth more together than the sum of their independent scores.
+            for group in _CORR_GROUPS:
+                helped = [(n, c) for n, c in cat_contribs.items()
+                          if n in group and c > 0]
+                if len(helped) >= 2:
+                    group_sum = sum(c for _, c in helped)
+                    score += group_sum * _CORR_BONUS * (len(helped) - 1)
 
             if score > 0:
                 scored.append({
