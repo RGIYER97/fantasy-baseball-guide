@@ -23,7 +23,7 @@ pip install -r requirements.txt
 
 ```bash
 python main.py
-# default: --source all
+# default: --source all, minimal output
 
 python main.py --source espn
 python main.py --source fangraphs
@@ -32,6 +32,7 @@ python main.py --source steamer
 python main.py --proj-system steamer   # steamer (default), zips, thebat, depthcharts
 python main.py --scout "Team Name"     # exact or partial team-name match
 python main.py --no-cache              # bypass disk cache
+python main.py --verbose               # show detailed output (rosters, loading messages, plate discipline, Savant signals)
 ```
 
 `--source` values:

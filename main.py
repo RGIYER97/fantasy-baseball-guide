@@ -5,6 +5,7 @@ from tabulate import tabulate
 import datetime
 
 from cache import cache_get, cache_set, _SCHEDULE_TTL
+from daily_lineup import recommend_daily_lineup
 from league_client import LeagueClient
 from pybaseball_stats import (
     build_fangraphs_lookups, build_recent_splits_lookups,
@@ -12,9 +13,9 @@ from pybaseball_stats import (
 )
 from projections_stats import build_projection_lookups, PROJECTION_SYSTEMS
 from savant_stats import build_savant_lookups, get_savant_signals
-from mlb_stats import get_schedule_context
+from mlb_stats import get_schedule_context, get_daily_matchups, get_player_handedness
 from recommender import Recommender, consensus_pickups
-from roster import eligible_display, positional_scarcity, set_league_slots
+from roster import eligible_display, get_starting_slots, positional_scarcity, set_league_slots
 
 RATE_3DEC = {'AVG', 'OBP', 'SLG', 'OPS', 'WHIP', 'OBA', 'OOBP'}
 RATE_2DEC = {'ERA', 'K/9', 'K/BB', 'PPA', 'FPCT', 'SV%', 'WPCT'}
@@ -665,6 +666,138 @@ def show_closer_targets(targets, categories):
     print('\n  Ranked by SV pace + ROS projection. Add to target losing SV/SVHD/HLD.')
 
 
+def _platoon_label(bats, throws):
+    if not bats or not throws:
+        return '?'
+    if bats == 'S':
+        return f'S/{throws}'
+    return f'{bats}v{throws}'
+
+
+_SLOT_ORDER = ['C', '1B', '2B', '3B', 'SS', 'MI', 'CI', 'IF',
+               'LF', 'CF', 'RF', 'OF', 'DH', 'UTIL']
+
+
+def _slot_sort_key(slot):
+    return _SLOT_ORDER.index(slot) if slot in _SLOT_ORDER else 99
+
+
+def show_daily_lineup(daily, today):
+    section(f"Today's Lineup — {today.isoformat()}")
+
+    lineup    = sorted(daily['lineup'], key=lambda e: _slot_sort_key(e['slot']))
+    bench     = daily['bench']
+    off_days  = daily['off_days']
+    sps_today = daily['sps_today']
+    sps_off   = daily['sps_off']
+
+    if lineup:
+        print('\n  Recommended Starters')
+        rows = []
+        for entry in lineup:
+            p = entry['player']
+            m = entry['matchup']
+            opp = m.get('opponent', '?')
+            home = '' if m.get('is_home') else '@'
+            sp = m.get('opp_pitcher', '') or '—'
+            hand = _platoon_label(entry['bat_hand'], entry['pitch_hand'])
+            curr = p.lineupSlot
+            name = p.name if curr == entry['slot'] else f'{p.name}  ← from {curr}'
+            rows.append([
+                entry['slot'], name, p.proTeam,
+                f'{home}{opp}', sp, hand,
+                f'{entry["base"]:.1f}',
+                f'{entry["platoon"]:.2f}',
+                f'{entry["form"]:.2f}',
+                f'{entry["park"]:.2f}',
+                f'{entry["score"]:.2f}',
+            ])
+        print(tabulate(rows,
+                       headers=['Slot', 'Player', 'Team', 'Opp', 'Opp SP',
+                                'Hand', 'Base', 'Plt', 'Form', 'Park', 'Score'],
+                       tablefmt='simple'))
+
+    # Bench — players with games today but not in the recommended lineup
+    bench_with_game = [b for b in bench if b.get('has_game')]
+    if bench_with_game:
+        print('\n  Sit / Bench (game today but not in suggested lineup)')
+        rows = []
+        for entry in bench_with_game:
+            p = entry['player']
+            m = entry['matchup']
+            opp = m.get('opponent', '?')
+            home = '' if m.get('is_home') else '@'
+            sp = m.get('opp_pitcher', '') or '—'
+            hand = _platoon_label(entry['bat_hand'], entry['pitch_hand'])
+            elig = entry.get('eligible', p.position)
+            rows.append([
+                p.name, p.proTeam, elig,
+                f'{home}{opp}', sp, hand,
+                f'{entry["score"]:.2f}',
+                p.lineupSlot,
+            ])
+        print(tabulate(rows,
+                       headers=['Player', 'Team', 'Eligible', 'Opp', 'Opp SP',
+                                'Hand', 'Score', 'Curr'],
+                       tablefmt='simple'))
+
+    if off_days:
+        print('\n  Off Day (no game scheduled today)')
+        rows = []
+        for entry in off_days:
+            p = entry['player']
+            rows.append([p.name, p.proTeam, entry.get('eligible', p.position),
+                         p.lineupSlot])
+        print(tabulate(rows,
+                       headers=['Player', 'Team', 'Eligible', 'Curr'],
+                       tablefmt='simple'))
+
+    if sps_today:
+        print('\n  Pitchers Starting Today')
+        rows = []
+        for sp in sps_today:
+            p = sp['player']
+            home = '' if sp['is_home'] else '@'
+            rows.append([p.name, p.proTeam, sp['eligible'],
+                         f'{home}{sp["opponent"]}', sp['venue'] or '?',
+                         p.lineupSlot])
+        print(tabulate(rows,
+                       headers=['Player', 'Team', 'Eligible', 'Opp', 'Venue', 'Curr'],
+                       tablefmt='simple'))
+
+    if sps_off:
+        non_probable = [sp for sp in sps_off if sp['player'].position == 'SP']
+        if non_probable:
+            print('\n  SPs not starting today (team plays but they aren\'t the probable)')
+            rows = []
+            for sp in non_probable:
+                p = sp['player']
+                rows.append([p.name, p.proTeam, p.lineupSlot])
+            print(tabulate(rows,
+                           headers=['Player', 'Team', 'Curr'],
+                           tablefmt='simple'))
+
+    rps_today = daily.get('rps_with_game', [])
+    rps_dark  = daily.get('rps_off', [])
+    if rps_today or rps_dark:
+        print('\n  Relievers — Team Schedule Today')
+        rows = []
+        for rp in rps_today:
+            p = rp['player']
+            home = '' if rp['is_home'] else '@'
+            rows.append([p.name, p.proTeam, p.lineupSlot,
+                         f'{home}{rp["opponent"]}', ''])
+        for rp in rps_dark:
+            p = rp['player']
+            note = '← consider sitting (no game)' if p.lineupSlot in ('RP', 'P') else ''
+            rows.append([p.name, p.proTeam, p.lineupSlot, 'OFF', note])
+        print(tabulate(rows,
+                       headers=['Player', 'Team', 'Curr', 'Game', ''],
+                       tablefmt='simple'))
+
+    print('\n  Score = (per-game projection) × platoon × recent form × park factor.')
+
+
 def show_streaming_queue(queue):
     section('Streaming Queue  (FA starters with 2+ starts this week)')
     rows = []
@@ -714,6 +847,12 @@ def parse_args():
         dest='no_cache',
         help='Bypass disk cache and fetch all external data fresh',
     )
+    p.add_argument(
+        '--verbose',
+        action='store_true',
+        dest='verbose',
+        help='Show detailed output (rosters, loading messages, plate discipline, Savant signals)',
+    )
     return p.parse_args()
 
 
@@ -732,18 +871,19 @@ def main():
         print('Copy config_example.py to config_private.py and fill in your values.')
         sys.exit(1)
 
-    print()
-    print('╔══════════════════════════════════════════════════════════════╗')
-    print('║         Fantasy Baseball — H2H Categories Helper           ║')
-    print('╚══════════════════════════════════════════════════════════════╝')
+    if args.verbose:
+        print()
+        print('╔══════════════════════════════════════════════════════════════╗')
+        print('║         Fantasy Baseball — H2H Categories Helper           ║')
+        print('╚══════════════════════════════════════════════════════════════╝')
 
-    from cache import _CACHE_DIR
-    if args.no_cache:
-        print('\n  Cache disabled (--no-cache)')
-    else:
-        print(f'\n  Cache dir:  {_CACHE_DIR}')
+        from cache import _CACHE_DIR
+        if args.no_cache:
+            print('\n  Cache disabled (--no-cache)')
+        else:
+            print(f'\n  Cache dir:  {_CACHE_DIR}')
 
-    print('\n  Connecting to ESPN …')
+        print('\n  Connecting to ESPN …')
     client = LeagueClient(LEAGUE_ID, YEAR, ESPN_S2, SWID)
 
     team = client.get_team(TEAM_NAME)
@@ -758,23 +898,26 @@ def main():
     bat_names = [c['name'] for c in categories if c['is_batting']]
     pit_names = [c['name'] for c in categories if c['is_pitching']]
 
-    print(f'  League:     {client.league.settings.name}')
-    print(f'  Team:       {team.team_name}')
-    print(f'  Format:     H2H Each Category')
-    print(f'  Rec source: {args.source}')
-    print(f'  Batting:    {", ".join(bat_names)}')
-    print(f'  Pitching:   {", ".join(pit_names)}')
+    if args.verbose:
+        print(f'  League:     {client.league.settings.name}')
+        print(f'  Team:       {team.team_name}')
+        print(f'  Format:     H2H Each Category')
+        print(f'  Rec source: {args.source}')
+        print(f'  Batting:    {", ".join(bat_names)}')
+        print(f'  Pitching:   {", ".join(pit_names)}')
 
-    print('\n  Loading roster slot configuration …')
+        print('\n  Loading roster slot configuration …')
     try:
         league_slots = client.get_roster_slots()
         set_league_slots(league_slots)
         slot_summary = {}
         for s in league_slots:
             slot_summary[s] = slot_summary.get(s, 0) + 1
-        print(f'  Lineup:     {", ".join(f"{v}x{k}" if v > 1 else k for k, v in slot_summary.items())}')
+        if args.verbose:
+            print(f'  Lineup:     {", ".join(f"{v}x{k}" if v > 1 else k for k, v in slot_summary.items())}')
     except Exception as e:
-        print(f'  Could not load roster slots from API ({e}), inferring from roster.')
+        if args.verbose:
+            print(f'  Could not load roster slots from API ({e}), inferring from roster.')
 
     matchup_info = client.get_matchup_info()
     matchup = client.get_current_matchup(team)
@@ -792,18 +935,22 @@ def main():
         if matchup_info:
             matchup_info['days_remaining'] = days_remaining
             matchup_info['total_days'] = max(total_days_reported, days_remaining)
-        print(f'  ⚠  Scoring period mapping unreliable (ESPN reported {total_days_reported}-day period).')
-        print(f'     Using calendar estimate: {days_remaining} days remaining this week.')
+        if args.verbose:
+            print(f'  ⚠  Scoring period mapping unreliable (ESPN reported {total_days_reported}-day period).')
+            print(f'     Using calendar estimate: {days_remaining} days remaining this week.')
 
-    print('\n  Fetching free agents …')
+    if args.verbose:
+        print('\n  Fetching free agents …')
     free_agents = client.get_free_agents(size=200)
 
     weekly_free_agents = None
     try:
-        print('  Fetching weekly projections …')
+        if args.verbose:
+            print('  Fetching weekly projections …')
         weekly_free_agents = client.get_free_agents_with_weekly_projections(size=200)
     except Exception:
-        print('  Weekly projections not available, using season projections.')
+        if args.verbose:
+            print('  Weekly projections not available, using season projections.')
 
     roster = team.roster
 
@@ -811,7 +958,8 @@ def main():
     starts_remaining: dict = {}
     team_games_remaining: dict = {}
     if days_remaining and days_remaining > 0:
-        print('\n  Fetching MLB schedule context …')
+        if args.verbose:
+            print('\n  Fetching MLB schedule context …')
         try:
             today = datetime.date.today()
             period_end = today + datetime.timedelta(days=days_remaining - 1)
@@ -819,15 +967,45 @@ def main():
             _hit = None if args.no_cache else cache_get(_ck, ttl=_SCHEDULE_TTL)
             if _hit is not None:
                 starts_remaining, team_games_remaining = _hit
-                print(f'  Schedule:   {len(starts_remaining)} pitchers / '
-                      f'{len(team_games_remaining)} teams (cached)')
+                if args.verbose:
+                    print(f'  Schedule:   {len(starts_remaining)} pitchers / '
+                          f'{len(team_games_remaining)} teams (cached)')
             else:
                 starts_remaining, team_games_remaining = get_schedule_context(today, period_end)
                 cache_set(_ck, (starts_remaining, team_games_remaining))
-                print(f'  Schedule:   {len(starts_remaining)} pitchers with known starts, '
-                      f'{len(team_games_remaining)} teams with games through {period_end}')
+                if args.verbose:
+                    print(f'  Schedule:   {len(starts_remaining)} pitchers with known starts, '
+                          f'{len(team_games_remaining)} teams with games through {period_end}')
         except Exception as e:
-            print(f'  Schedule fetch failed: {e}')
+            if args.verbose:
+                print(f'  Schedule fetch failed: {e}')
+
+    # ── Today's matchups + player handedness for daily start/sit ──────────
+    today = datetime.date.today()
+    daily_matchups: dict = {}
+    handedness: dict = {}
+    try:
+        _ck = f'daily_matchups_{today.isoformat()}'
+        _hit = None if args.no_cache else cache_get(_ck, ttl=3600)
+        if _hit is not None:
+            daily_matchups = _hit
+        else:
+            daily_matchups = get_daily_matchups(today)
+            cache_set(_ck, daily_matchups)
+    except Exception as e:
+        if args.verbose:
+            print(f'  Daily matchup fetch failed: {e}')
+    try:
+        _ck = f'mlb_handedness_{YEAR}'
+        _hit = None if args.no_cache else cache_get(_ck, ttl=24 * 3600)
+        if _hit is not None:
+            handedness = _hit
+        else:
+            handedness = get_player_handedness(int(YEAR))
+            cache_set(_ck, handedness)
+    except Exception as e:
+        if args.verbose:
+            print(f'  Handedness fetch failed: {e}')
 
     rec = Recommender(
         categories, matchup, roster, free_agents,
@@ -842,7 +1020,8 @@ def main():
     _fg_hit = None
     fg_bat_p = fg_bat_bn = fg_pit_p = fg_pit_bn = None
     if args.source in ('all', 'fangraphs'):
-        print(f'\n  Loading FanGraphs leader stats via pybaseball (MLB season {fg_year}) …')
+        if args.verbose:
+            print(f'\n  Loading FanGraphs leader stats via pybaseball (MLB season {fg_year}) …')
         try:
             _ck = f'fg_leaders_{fg_year}'
             _fg_hit = None if args.no_cache else cache_get(_ck)
@@ -852,7 +1031,8 @@ def main():
                 fg_bat_p, fg_bat_bn, fg_pit_p, fg_pit_bn = build_fangraphs_lookups(int(fg_year))
                 cache_set(_ck, (fg_bat_p, fg_bat_bn, fg_pit_p, fg_pit_bn))
         except Exception as e:
-            print(f'  FanGraphs load failed: {e}')
+            if args.verbose:
+                print(f'  FanGraphs load failed: {e}')
             if args.source == 'fangraphs':
                 sys.exit(2)
             fg_bat_p = fg_bat_bn = fg_pit_p = fg_pit_bn = None
@@ -860,16 +1040,18 @@ def main():
     fg_h = fg_p = None
     if fg_bat_p is not None:
         fg_h, fg_p = rec.split_free_agents_fangraphs(fg_bat_p, fg_bat_bn, fg_pit_p, fg_pit_bn)
-        _tag = ' (cached)' if _fg_hit is not None else ''
-        print(f'  FanGraphs YTD: {len(fg_bat_p)} batters / {len(fg_pit_p)} pitchers{_tag} '
-              f'→ {len(fg_h)} FA hitters / {len(fg_p)} FA pitchers matched')
+        if args.verbose:
+            _tag = ' (cached)' if _fg_hit is not None else ''
+            print(f'  FanGraphs YTD: {len(fg_bat_p)} batters / {len(fg_pit_p)} pitchers{_tag} '
+                  f'→ {len(fg_h)} FA hitters / {len(fg_p)} FA pitchers matched')
 
     # ── Steamer / ZiPS / THE BAT ROS projections ──────────────────────────
     _st_hit = None
     st_bat_p = st_bat_bn = st_pit_p = st_pit_bn = None
     proj_label = args.proj_system.title()
     if args.source in ('all', 'steamer'):
-        print(f'\n  Loading {proj_label} ROS projections from FanGraphs …')
+        if args.verbose:
+            print(f'\n  Loading {proj_label} ROS projections from FanGraphs …')
         try:
             _ck = f'fg_proj_{args.proj_system}_{fg_year}'
             _st_hit = None if args.no_cache else cache_get(_ck, ttl=8 * 3600)
@@ -879,39 +1061,46 @@ def main():
                 st_bat_p, st_bat_bn, st_pit_p, st_pit_bn = build_projection_lookups(args.proj_system)
                 cache_set(_ck, (st_bat_p, st_bat_bn, st_pit_p, st_pit_bn))
         except Exception as e:
-            print(f'  {proj_label} load failed: {e}')
+            if args.verbose:
+                print(f'  {proj_label} load failed: {e}')
             if args.source == 'steamer':
                 sys.exit(2)
 
     st_h = st_p = None
     if st_bat_p is not None:
         st_h, st_p = rec.split_free_agents_fangraphs(st_bat_p, st_bat_bn, st_pit_p, st_pit_bn)
-        _tag = ' (cached)' if _st_hit is not None else ''
-        print(f'  {proj_label}:   {len(st_bat_p)} batters / {len(st_pit_p)} pitchers{_tag} '
-              f'→ {len(st_h)} FA hitters / {len(st_p)} FA pitchers matched')
+        if args.verbose:
+            _tag = ' (cached)' if _st_hit is not None else ''
+            print(f'  {proj_label}:   {len(st_bat_p)} batters / {len(st_pit_p)} pitchers{_tag} '
+                  f'→ {len(st_h)} FA hitters / {len(st_p)} FA pitchers matched')
 
     # ── Baseball Savant xStats ─────────────────────────────────────────────
     savant_bat = savant_pit = None
     if args.source == 'all':
-        print('\n  Loading Baseball Savant xStats …')
+        if args.verbose:
+            print('\n  Loading Baseball Savant xStats …')
         try:
             _ck = f'savant_{fg_year}'
             _hit = None if args.no_cache else cache_get(_ck)
             if _hit is not None:
                 savant_bat, savant_pit = _hit
-                print(f'  Savant:        {len(savant_bat)} batters / {len(savant_pit)} pitchers (cached)')
+                if args.verbose:
+                    print(f'  Savant:        {len(savant_bat)} batters / {len(savant_pit)} pitchers (cached)')
             else:
                 savant_bat, savant_pit = build_savant_lookups(int(fg_year))
                 cache_set(_ck, (savant_bat, savant_pit))
-                print(f'  Savant:        {len(savant_bat)} batters / {len(savant_pit)} pitchers loaded')
+                if args.verbose:
+                    print(f'  Savant:        {len(savant_bat)} batters / {len(savant_pit)} pitchers loaded')
         except Exception as e:
-            print(f'  Savant load failed: {e}')
+            if args.verbose:
+                print(f'  Savant load failed: {e}')
 
     # ── Recent form (L14 FanGraphs) ────────────────────────────────────────
     _rec_hit = None
     rec_bat_p = rec_bat_bn = rec_pit_p = rec_pit_bn = None
     if args.source == 'all':
-        print('\n  Loading recent form (L14 FanGraphs) …')
+        if args.verbose:
+            print('\n  Loading recent form (L14 FanGraphs) …')
         try:
             _ck = f'fg_recent_{fg_year}_14d'
             _rec_hit = None if args.no_cache else cache_get(_ck)
@@ -922,32 +1111,37 @@ def main():
                     int(fg_year), days=14)
                 cache_set(_ck, (rec_bat_p, rec_bat_bn, rec_pit_p, rec_pit_bn))
         except Exception as e:
-            print(f'  Recent splits load failed: {e}')
+            if args.verbose:
+                print(f'  Recent splits load failed: {e}')
 
     recent_h = recent_p = None
     if rec_bat_p is not None:
         recent_h, recent_p = rec.split_free_agents_fangraphs(
             rec_bat_p, rec_bat_bn, rec_pit_p, rec_pit_bn)
-        _tag = ' (cached)' if _rec_hit is not None else ''
-        print(f'  Recent (L14):  {len(rec_bat_p)} batters / {len(rec_pit_p)} pitchers{_tag} '
-              f'→ {len(recent_h)} FA hitters / {len(recent_p)} FA pitchers matched')
+        if args.verbose:
+            _tag = ' (cached)' if _rec_hit is not None else ''
+            print(f'  Recent (L14):  {len(rec_bat_p)} batters / {len(rec_pit_p)} pitchers{_tag} '
+                  f'→ {len(recent_h)} FA hitters / {len(recent_p)} FA pitchers matched')
 
     # ── Plate discipline (FanGraphs SwStr% / Contact%) ────────────────────
     _disc_hit = None
     bat_disc = pit_disc = None
     if args.source == 'all':
-        print('\n  Loading plate discipline data …')
+        if args.verbose:
+            print('\n  Loading plate discipline data …')
         try:
             _ck = f'fg_disc_{fg_year}'
             _disc_hit = None if args.no_cache else cache_get(_ck)
             if _disc_hit is not None:
                 bat_disc, pit_disc = _disc_hit
-                print(f'  Plate discipline: loaded from cache')
+                if args.verbose:
+                    print(f'  Plate discipline: loaded from cache')
             else:
                 bat_disc, pit_disc = build_plate_discipline_lookups(int(fg_year))
                 cache_set(_ck, (bat_disc, pit_disc))
         except Exception as e:
-            print(f'  Plate discipline load failed: {e}')
+            if args.verbose:
+                print(f'  Plate discipline load failed: {e}')
 
     # ── Compute all recs before any display ───────────────────────────────
     analysis = rec.analyze_matchup() if matchup else None
@@ -993,7 +1187,35 @@ def main():
         ('L14',    weekly_recent),
     ]
 
-    show_roster(roster, categories)
+    if args.verbose:
+        show_roster(roster, categories)
+
+    # Daily start/sit — uses ROS projection (preferred) or ESPN season fallback.
+    season_lookup = None
+    if st_bat_p is not None:
+        season_lookup = (st_bat_p, st_bat_bn, st_pit_p, st_pit_bn)
+    elif fg_bat_p is not None:
+        season_lookup = (fg_bat_p, fg_bat_bn, fg_pit_p, fg_pit_bn)
+    recent_lookup = None
+    if rec_bat_p is not None:
+        recent_lookup = (rec_bat_p, rec_bat_bn, rec_pit_p, rec_pit_bn)
+
+    if daily_matchups:
+        try:
+            daily = recommend_daily_lineup(
+                roster=roster,
+                daily_matchups=daily_matchups,
+                handedness=handedness,
+                season_lookup=season_lookup,
+                recent_lookup=recent_lookup,
+                starting_slots=get_starting_slots(roster),
+                batting_cats=[c for c in categories if c['is_batting']],
+                pitching_cats=[c for c in categories if c['is_pitching']],
+                stat_weights=stat_weights,
+            )
+            show_daily_lineup(daily, today)
+        except Exception as e:
+            print(f'\n  Daily lineup recommendation failed: {e}')
 
     if args.scout:
         _scout_lower = args.scout.lower()
@@ -1013,7 +1235,8 @@ def main():
     if matchup:
         show_matchup(analysis, matchup, matchup_info)
         if opp and hasattr(opp, 'roster'):
-            show_opponent_roster(opp, categories)
+            if args.verbose:
+                show_opponent_roster(opp, categories)
             show_projected_outcome(proj_outcome, opp_name, days_remaining)
     else:
         print('\n  No active matchup found. Skipping weekly pickup sections.')
@@ -1090,10 +1313,10 @@ def main():
             show_consensus_season(sh, sp, categories,
                                   title=f'ESPN ∩ {proj_label} ROS (both top lists)')
 
-    if bat_disc is not None and pit_disc is not None:
+    if args.verbose and bat_disc is not None and pit_disc is not None:
         show_plate_discipline(free_agents, pit_disc, bat_disc, categories)
 
-    if savant_signals is not None:
+    if args.verbose and savant_signals is not None:
         show_savant_signals(savant_signals)
 
     show_summary(analysis, matchup, proj_outcome, opp_name, weekly_sources, savant_signals)

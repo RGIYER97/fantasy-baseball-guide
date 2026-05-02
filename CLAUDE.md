@@ -19,18 +19,26 @@ pip install -r requirements.txt
 ## Run Commands
 
 ```bash
-python main.py                        # default: --source all
+python main.py                        # default: --source all, minimal output
 python main.py --source espn          # ESPN projections only
 python main.py --source fangraphs     # FanGraphs YTD only
 python main.py --source steamer       # ROS projections only
 python main.py --proj-system zips     # steamer / zips / thebat / depthcharts
 python main.py --scout "Team Name"    # scout any roster by name (partial match supported)
 python main.py --no-cache             # bypass disk cache, fetch all data fresh
+python main.py --verbose              # show detailed output (rosters, loading messages, plate discipline, Savant signals)
 ```
 
 ## Core Flow
 
 `LeagueClient` fetches ESPN data -> `Recommender` ranks and filters moves -> `main.py` renders output sections.
+
+**`daily_lineup.py` — Today's start/sit recommendations**
+- For each non-pitcher on the roster (excluding IL slot), computes a per-day score:
+  `base × platoon × recent form × park`. Base = league-weighted per-game value (ROS counting stats / G); rate stats are skipped. Platoon: 1.07 opposite-handed, 0.93 same-handed, 1.0 switch — driven by MLB StatsAPI handedness. Recent form: L14 per-game value ÷ season per-game value, clamped to [0.75, 1.25]. Park factor: static `_PARK_FACTORS_BY_VENUE` LUT (3-year approximate runs index, 1.00 = neutral).
+- `assign_lineup()` is **position-respecting**: current starters stay in their assigned slot; bench players can only be promoted into a slot they're eligible for (same-position swap) or into UTIL. No cross-slot starter shuffles — Correa at 3B will not be moved to SS just because the algorithm could optimize the total. Non-UTIL slots are processed scarcer-first so a multi-position bench player (e.g., a 3B/SS/OF utility hitter) lands where they're most needed; ties favor the incumbent. UTIL is filled last from any unassigned player with a game.
+- `recommend_daily_lineup()` returns `lineup`, `bench` (had a game but not chosen), `off_days` (no game today), `sps_today` (probable starters), `sps_off` (SPs whose team plays but they aren't the probable), `rps_with_game` (RPs whose team plays — appearance possible), and `rps_off` (RPs whose team is dark — flagged to sit if currently in an active slot).
+- RPs are not part of `assign_lineup` since they don't start. `is_pitcher_starting_today()` is used only for SPs/multi-P, matching normalized name against the opposing-team probable in `daily_matchups`.
 
 **`league_client.py` — ESPN API wrapper**
 - `LeagueClient` wraps `espn_api.baseball.League` and exposes scoring categories, stat weights, matchup data, roster slots, and free agents.
@@ -53,6 +61,11 @@ python main.py --no-cache             # bypass disk cache, fetch all data fresh
 - `get_closer_targets(analysis, ytd_pitchers, ros_pitchers)` — fires only when SV/SVHD/HLD is a losing category. Filters FA relievers by SV pace (YTD SV/G ≥ 0.10) or season saves (≥5) or ROS projection (≥2). Blends pace 60% / ROS 40% for ranking. Does not apply the net-positive swap filter (closer adds are always worth evaluating for saves).
 - `get_streaming_queue(pitchers)` — FA starters with `starts_remaining ≥ 2` this week, ranked by quality via zero-margin pitching category scoring, then sorted starts-first. Only returns results when MLB schedule context is available.
 
+**`mlb_stats.py` — Schedule + handedness**
+- `get_schedule_context(start, end)` — `(starts_remaining, team_games_remaining)` over a date range.
+- `get_daily_matchups(date)` — keyed by team abbr, returns `{opponent, opp_pitcher, venue, is_home, game_time}` for one calendar day. Hydrates `probablePitcher,team,venue` on the schedule endpoint.
+- `get_player_handedness(year)` — single MLB StatsAPI call to `/sports/1/players?season={year}`; returns `{normalized_name: {bats, throws}}` for every active player. Used for batter platoon and looking up opposing pitcher hand.
+
 **`pybaseball_stats.py` — FanGraphs data**
 - Calls the FanGraphs JSON API directly and maps column names to ESPN stat keys.
 - Only players who appear in the ESPN free-agent list are scored, so FG data is filtered to the relevant pool.
@@ -74,7 +87,8 @@ python main.py --no-cache             # bypass disk cache, fetch all data fresh
 - `RATE_3DEC` / `RATE_2DEC` control decimal formatting for rate stats in all tables.
 - Stat weights from ESPN (`scoringItems`) default to 1.0 per category when ESPN reports 0 points (pure category leagues).
 - `--scout TEAM` shows any team's roster with projections (partial name match); useful for trade targets or upcoming opponents.
-- **Output flow:** all recommendations are computed first, then displayed in this order: roster → matchup → opponent roster → projected outcome → weekly recs → streaming queue → closer targets → drop candidates → season recs → consensus → plate discipline → Savant signals → summary. The `show_summary` TL;DR is printed **last** so the conclusion lands after all detail tables. Sections with no content are suppressed rather than printing empty banners.
+- **Output flow:** all recommendations are computed first, then displayed in this order: roster → today's lineup → matchup → opponent roster → projected outcome → weekly recs → streaming queue → closer targets → drop candidates → season recs → consensus → plate discipline → Savant signals → summary. The `show_summary` TL;DR is printed **last** so the conclusion lands after all detail tables. Sections with no content are suppressed rather than printing empty banners.
+- `show_daily_lineup` is rendered after `show_roster` and before the matchup section. It prints **Recommended Starters** (sorted by natural slot order C/1B/2B/3B/SS/OF/UTIL with `← from X` indicators when the suggestion differs from current), **Sit / Bench**, **Off Day**, **Pitchers Starting Today**, **SPs not starting today**, and **Relievers — Team Schedule Today** (with `← consider sitting (no game)` when an active-slot RP's team is dark). The whole section is gated on `daily_matchups` being non-empty.
 - `_cross_source_consensus` aggregates the top-10 of each weekly source and surfaces players appearing in 2+ lists. `_has_recs` guards all `show_weekly`, `show_season`, and `show_consensus_*` calls.
 - `show_streaming_queue` only renders if `rec.get_streaming_queue()` returns results (requires schedule context).
 - `show_closer_targets` only renders if losing save categories and qualifying FA relievers exist.
