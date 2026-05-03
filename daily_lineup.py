@@ -4,14 +4,16 @@ Daily start/sit recommendations.
 For each batter on the roster, produces a per-day score combining:
   1. Per-game projection scaled from ROS counting stats.
   2. Platoon advantage based on opposing probable pitcher's handedness.
-  3. Recent form (last 14 days vs season pace).
-  4. Park factor (hitter-friendliness of today's venue).
+  3. Recent form (last 14 days vs season pace), Bayesian-shrunk toward season avg.
+  4. Park factor (hitter-friendliness of today's venue), split by bat hand.
+  5. Opposing SP quality relative to league-average ERA.
 
 For pitchers, simply flags whose probable start is today.
 
 A greedy slot assignment fills the league lineup highest-scored player first,
 processing slots in scarcity order (positions with fewest eligible players go
-first) so a flex slot can't poach the only catcher.
+first) so a flex slot can't poach the only catcher.  UTIL tiebreaks prefer
+players whose team has more games remaining this week.
 """
 
 from __future__ import annotations
@@ -26,54 +28,69 @@ from roster import (
 )
 
 
-# ── Park factors (single-number runs index, 1.00 = neutral) ─────────────────
-# Approximate 3-year averages from public sources (Statcast / FanGraphs).
-# Keyed by both team abbreviation and the MLB StatsAPI venue name so either
-# end of the lookup chain works.
-_PARK_FACTORS_BY_VENUE = {
-    'Coors Field':              1.20,
-    'Great American Ball Park': 1.09,
-    'Globe Life Field':         1.07,
-    'Fenway Park':              1.06,
-    'Yankee Stadium':           1.05,
-    'Truist Park':              1.04,
-    'Citizens Bank Park':       1.04,
-    'Wrigley Field':            1.03,
-    'Rogers Centre':            1.03,
-    'Chase Field':              1.02,
-    'Camden Yards':             1.02,
-    'Oriole Park at Camden Yards': 1.02,
-    'Nationals Park':           1.01,
-    'Target Field':             1.01,
-    'Citi Field':               1.00,
-    'Progressive Field':        1.00,
-    'Daikin Park':              1.00,
-    'Minute Maid Park':         1.00,
-    'Dodger Stadium':           0.99,
-    'Angel Stadium':             0.99,
-    'Busch Stadium':             0.98,
-    'PNC Park':                  0.98,
-    'American Family Field':     0.98,
-    'Kauffman Stadium':          0.97,
-    'Comerica Park':             0.97,
-    'Sutter Health Park':        0.97,   # Athletics' temporary home
-    'Oakland Coliseum':          0.96,
-    'Guaranteed Rate Field':     0.96,
-    'Rate Field':                0.96,
-    'Oracle Park':               0.94,
-    'loanDepot park':            0.93,
-    'LoanDepot park':            0.93,
-    'Petco Park':                0.94,
-    'T-Mobile Park':             0.92,
-    'Tropicana Field':           0.92,
-    'George M. Steinbrenner Field': 0.96,  # Rays' temporary home
+# ── Park factors split by batter handedness ──────────────────────────────────
+# Each venue maps to {'L': factor, 'R': factor}.  Switch hitters ('S') or
+# unknown handedness fall back to the average of L and R.
+# Sources: Statcast / FanGraphs 3-year park factor tables (approximate).
+_PARK_SPLITS: Dict[str, Dict[str, float]] = {
+    'Coors Field':              {'L': 1.20, 'R': 1.20},
+    'Great American Ball Park': {'L': 1.08, 'R': 1.10},
+    'Globe Life Field':         {'L': 1.07, 'R': 1.07},
+    # Fenway: Green Monster boosts RHB pull-side doubles; LHB pull to deep RF
+    'Fenway Park':              {'L': 1.03, 'R': 1.09},
+    # Yankee Stadium: short porch in RF is a LHB gift
+    'Yankee Stadium':           {'L': 1.09, 'R': 1.02},
+    'Truist Park':              {'L': 1.04, 'R': 1.04},
+    'Citizens Bank Park':       {'L': 1.04, 'R': 1.04},
+    'Wrigley Field':            {'L': 1.03, 'R': 1.03},
+    'Rogers Centre':            {'L': 1.02, 'R': 1.04},
+    'Chase Field':              {'L': 1.01, 'R': 1.03},
+    # Camden: shorter RF porch helps LHBs slightly
+    'Camden Yards':             {'L': 1.03, 'R': 1.01},
+    'Oriole Park at Camden Yards': {'L': 1.03, 'R': 1.01},
+    'Nationals Park':           {'L': 1.01, 'R': 1.01},
+    # Target Field: warm-season hitter-friendly, RHB benefit from shorter RF
+    'Target Field':             {'L': 1.00, 'R': 1.02},
+    'Citi Field':               {'L': 0.99, 'R': 1.01},
+    'Progressive Field':        {'L': 1.00, 'R': 1.00},
+    'Daikin Park':              {'L': 1.00, 'R': 1.00},
+    # Minute Maid: Crawford Boxes in LF boost RHB
+    'Minute Maid Park':         {'L': 0.98, 'R': 1.02},
+    'Dodger Stadium':           {'L': 0.99, 'R': 0.99},
+    'Angel Stadium':            {'L': 0.98, 'R': 1.00},
+    'Busch Stadium':            {'L': 0.97, 'R': 0.99},
+    # PNC: deep RF hurts LHB pull-side HRs
+    'PNC Park':                 {'L': 0.96, 'R': 1.00},
+    'American Family Field':    {'L': 0.97, 'R': 0.99},
+    'Kauffman Stadium':         {'L': 0.96, 'R': 0.98},
+    'Comerica Park':            {'L': 0.96, 'R': 0.98},
+    'Sutter Health Park':       {'L': 0.97, 'R': 0.97},
+    'Oakland Coliseum':         {'L': 0.96, 'R': 0.96},
+    'Guaranteed Rate Field':    {'L': 0.95, 'R': 0.97},
+    'Rate Field':               {'L': 0.95, 'R': 0.97},
+    # Oracle: very deep RF hurts RHB pull-side power specifically
+    'Oracle Park':              {'L': 0.96, 'R': 0.92},
+    # loanDepot: deep RF hurts LHB pull; moderate for RHB
+    'loanDepot park':           {'L': 0.91, 'R': 0.95},
+    'LoanDepot park':           {'L': 0.91, 'R': 0.95},
+    # Petco: pitcher-friendly, LCF and CF very deep
+    'Petco Park':               {'L': 0.93, 'R': 0.95},
+    'T-Mobile Park':            {'L': 0.91, 'R': 0.93},
+    'Tropicana Field':          {'L': 0.91, 'R': 0.93},
+    'George M. Steinbrenner Field': {'L': 0.96, 'R': 0.96},
 }
 
 
-def _park_factor(venue: str) -> float:
+def _park_factor(venue: str, bat_hand: str = '') -> float:
     if not venue:
         return 1.0
-    return _PARK_FACTORS_BY_VENUE.get(venue, 1.0)
+    splits = _PARK_SPLITS.get(venue)
+    if splits is None:
+        return 1.0
+    hand = bat_hand if bat_hand in ('L', 'R') else ''
+    if hand:
+        return splits[hand]
+    return sum(splits.values()) / len(splits)
 
 
 # ── Platoon multiplier (batter vs pitcher hand) ─────────────────────────────
@@ -87,6 +104,27 @@ def _platoon_multiplier(bats: str, throws: str) -> float:
     if bats == throws:
         return 0.93        # same-handed (disadvantage)
     return 1.07            # opposite-handed (advantage)
+
+
+# ── Opposing SP quality ─────────────────────────────────────────────────────
+_LEAGUE_AVG_ERA = 4.20
+
+def _opp_sp_quality(opp_sp_stats: Optional[dict]) -> float:
+    """Multiplier for opposing starter quality relative to league-average ERA.
+
+    Good SPs (low ERA) penalise batter scores; bad SPs (high ERA) boost them.
+    ERA is clamped to [1.50, 8.00] to dampen tiny-sample extremes, then
+    scaled around the league average with a sensitivity of 0.04 per ERA point.
+    Result clamped to [0.85, 1.15].
+    """
+    if not opp_sp_stats:
+        return 1.0
+    era = opp_sp_stats.get('ERA')
+    if era is None or float(era) <= 0:
+        return 1.0
+    era = max(1.50, min(8.00, float(era)))
+    raw = 1.0 + (era - _LEAGUE_AVG_ERA) * 0.04
+    return round(max(0.85, min(1.15, raw)), 3)
 
 
 # ── Per-game value ─────────────────────────────────────────────────────────
@@ -117,23 +155,30 @@ def _per_game_value(proj: dict, batting_cats, stat_weights: dict) -> float:
     return score
 
 
+# ── Recent form (Bayesian-shrunk) ──────────────────────────────────────────
+_FORM_PRIOR_PA = 50.0   # prior weight in PA; shrinks ratio toward 1.0 for short samples
+
 def _recent_form_multiplier(
     recent_proj: Optional[dict], season_proj: Optional[dict],
     batting_cats, stat_weights: dict,
 ) -> float:
-    """Ratio of recent (L14) per-game value to season per-game value.
+    """Bayesian-shrunk ratio of recent (L14) per-game value to season per-game value.
 
-    Capped at [0.75, 1.25] so a small-sample hot streak doesn't dominate.
-    Returns 1.0 when recent or season data is missing.
+    Blends the observed ratio with a prior of 1.0 (= season pace) weighted by
+    _FORM_PRIOR_PA.  A batter with 10 PA in the recent window gets ~17% weight
+    on their recent ratio; one with 50 PA gets ~50%.  Final result clamped to
+    [0.90, 1.10] — tighter than the old [0.75, 1.25] to resist noise.
     """
     if not recent_proj or not season_proj:
         return 1.0
-    recent_val = _per_game_value(recent_proj, batting_cats, stat_weights)
-    season_val = _per_game_value(season_proj, batting_cats, stat_weights)
-    if season_val <= 0 or recent_val <= 0:
+    recent_pgv = _per_game_value(recent_proj, batting_cats, stat_weights)
+    season_pgv = _per_game_value(season_proj, batting_cats, stat_weights)
+    if season_pgv <= 0 or recent_pgv <= 0:
         return 1.0
-    ratio = recent_val / season_val
-    return max(0.75, min(1.25, ratio))
+    ratio = recent_pgv / season_pgv
+    recent_pa = float(recent_proj.get('PA') or 0)
+    blended = (recent_pa * ratio + _FORM_PRIOR_PA * 1.0) / (recent_pa + _FORM_PRIOR_PA)
+    return round(max(0.90, min(1.10, blended)), 3)
 
 
 # ── Batter scoring ─────────────────────────────────────────────────────────
@@ -144,6 +189,7 @@ def score_batter_today(
     matchup: Optional[dict],
     bat_hand: str,
     pitch_hand: str,
+    opp_sp_stats: Optional[dict],
     batting_cats,
     stat_weights: dict,
 ) -> dict:
@@ -156,33 +202,36 @@ def score_batter_today(
     has_game = matchup is not None
     if not has_game or base <= 0:
         return {
-            'player':     player,
-            'has_game':   has_game,
-            'score':      0.0,
-            'base':       round(base, 2),
-            'platoon':    1.0,
-            'form':       1.0,
-            'park':       1.0,
-            'matchup':    matchup,
-            'bat_hand':   bat_hand,
-            'pitch_hand': pitch_hand,
+            'player':      player,
+            'has_game':    has_game,
+            'score':       0.0,
+            'base':        round(base, 2),
+            'platoon':     1.0,
+            'form':        1.0,
+            'park':        1.0,
+            'opp_quality': 1.0,
+            'matchup':     matchup,
+            'bat_hand':    bat_hand,
+            'pitch_hand':  pitch_hand,
         }
 
-    platoon = _platoon_multiplier(bat_hand, pitch_hand)
-    form    = _recent_form_multiplier(recent_proj, season_proj, batting_cats, stat_weights)
-    park    = _park_factor(matchup.get('venue', ''))
+    platoon     = _platoon_multiplier(bat_hand, pitch_hand)
+    form        = _recent_form_multiplier(recent_proj, season_proj, batting_cats, stat_weights)
+    park        = _park_factor(matchup.get('venue', ''), bat_hand)
+    opp_quality = _opp_sp_quality(opp_sp_stats)
 
     return {
-        'player':     player,
-        'has_game':   True,
-        'score':      round(base * platoon * form * park, 3),
-        'base':       round(base, 2),
-        'platoon':    round(platoon, 3),
-        'form':       round(form, 3),
-        'park':       round(park, 3),
-        'matchup':    matchup,
-        'bat_hand':   bat_hand,
-        'pitch_hand': pitch_hand,
+        'player':      player,
+        'has_game':    True,
+        'score':       round(base * platoon * form * park * opp_quality, 3),
+        'base':        round(base, 2),
+        'platoon':     round(platoon, 3),
+        'form':        round(form, 3),
+        'park':        round(park, 3),
+        'opp_quality': opp_quality,
+        'matchup':     matchup,
+        'bat_hand':    bat_hand,
+        'pitch_hand':  pitch_hand,
     }
 
 
@@ -222,6 +271,7 @@ def _pid(entry):
 def assign_lineup(
     scored_batters: List[dict],
     starting_slots: List[str],
+    team_games_remaining: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[dict], List[dict]]:
     """Position-respecting slot assignment.
 
@@ -234,12 +284,14 @@ def assign_lineup(
       - Cross-slot starter shuffles are not generated — Correa at 3B does not
         get suggested for SS.
 
-    UTIL is filled last from any unassigned player, so a multi-position bench
-    player can fall through to UTIL when their natural slot already has a
-    higher-scoring incumbent.
+    UTIL is filled last from any unassigned player with a game.  Ties among
+    UTIL candidates break in favour of the player whose team has more games
+    remaining this scoring period (multi-day lookahead).
 
     Returns (lineup_assignments, leftover_bench).
     """
+    tgr = team_games_remaining or {}
+
     real_slots = [s for s in starting_slots if s not in BENCH_SLOTS
                   and s not in ('SP', 'RP', 'P')]
 
@@ -293,6 +345,7 @@ def assign_lineup(
             used_pids.add(_pid(entry))
 
     # UTIL last — any unassigned player with a game.
+    # Primary sort: today's score.  Tiebreaker: games remaining this week.
     util_count = slot_counts.get('UTIL', 0)
     if util_count:
         util_pool = [
@@ -301,7 +354,13 @@ def assign_lineup(
             and e.get('has_game')
             and 'UTIL' in getattr(e['player'], 'eligibleSlots', [])
         ]
-        util_pool.sort(key=lambda x: x['score'], reverse=True)
+
+        def _util_key(e):
+            team = str(getattr(e['player'], 'proTeam', '') or '').upper().strip()
+            games_left = tgr.get(team, 0)
+            return (e['score'], games_left)
+
+        util_pool.sort(key=_util_key, reverse=True)
         for entry in util_pool[:util_count]:
             lineup.append({'slot': 'UTIL', **entry})
             used_pids.add(_pid(entry))
@@ -321,6 +380,7 @@ def recommend_daily_lineup(
     batting_cats,
     pitching_cats,
     stat_weights: dict,
+    team_games_remaining: Optional[Dict[str, int]] = None,
 ) -> dict:
     """Build the full daily recommendation payload.
 
@@ -335,12 +395,26 @@ def recommend_daily_lineup(
       'sps_today' : pitchers from the roster scheduled to start today
       'sps_off'   : roster SPs whose team plays but they aren't the probable
     """
-    s_bat_p = s_bat_bn = None
+    s_bat_p = s_bat_bn = s_pit_p = s_pit_bn = None
     if season_lookup is not None:
-        s_bat_p, s_bat_bn, _, _ = season_lookup
+        s_bat_p, s_bat_bn, s_pit_p, s_pit_bn = season_lookup
     r_bat_p = r_bat_bn = None
     if recent_lookup is not None:
         r_bat_p, r_bat_bn, _, _ = recent_lookup
+
+    # Pre-compute opp SP stats per (batter's) opponent team so we only look
+    # up each pitcher once rather than once per roster player.
+    _opp_sp_cache: Dict[str, Optional[dict]] = {}
+
+    def _get_opp_sp_stats(opp_pitcher: str, opp_team: str) -> Optional[dict]:
+        key = f'{opp_pitcher}|{opp_team}'
+        if key in _opp_sp_cache:
+            return _opp_sp_cache[key]
+        stats = None
+        if opp_pitcher and s_pit_p is not None:
+            stats = lookup_pitcher(opp_pitcher, opp_team, s_pit_p, s_pit_bn)
+        _opp_sp_cache[key] = stats
+        return stats
 
     scored: List[dict] = []
     off_days: List[dict] = []
@@ -369,14 +443,18 @@ def recommend_daily_lineup(
         bat_hand = (handedness.get(nn) or {}).get('bats', '')
 
         pitch_hand = ''
+        opp_sp_stats = None
         if matchup:
             opp_pp = matchup.get('opp_pitcher', '')
+            opp_team = matchup.get('opponent', '')
             if opp_pp:
                 pitch_hand = (handedness.get(normalize_name(opp_pp)) or {}).get('throws', '')
+                opp_sp_stats = _get_opp_sp_stats(opp_pp, opp_team)
 
         entry = score_batter_today(
             player, season_proj, recent_proj, matchup,
-            bat_hand, pitch_hand, batting_cats, stat_weights,
+            bat_hand, pitch_hand, opp_sp_stats,
+            batting_cats, stat_weights,
         )
         entry['eligible'] = eligible_display(player)
 
@@ -385,7 +463,7 @@ def recommend_daily_lineup(
         else:
             scored.append(entry)
 
-    lineup, bench = assign_lineup(scored, starting_slots)
+    lineup, bench = assign_lineup(scored, starting_slots, team_games_remaining)
 
     sps_today: List[dict] = []
     sps_off:   List[dict] = []

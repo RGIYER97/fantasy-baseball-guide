@@ -710,11 +710,12 @@ def show_daily_lineup(daily, today):
                 f'{entry["platoon"]:.2f}',
                 f'{entry["form"]:.2f}',
                 f'{entry["park"]:.2f}',
+                f'{entry["opp_quality"]:.2f}',
                 f'{entry["score"]:.2f}',
             ])
         print(tabulate(rows,
                        headers=['Slot', 'Player', 'Team', 'Opp', 'Opp SP',
-                                'Hand', 'Base', 'Plt', 'Form', 'Park', 'Score'],
+                                'Hand', 'Base', 'Plt', 'Form', 'Park', 'SP', 'Score'],
                        tablefmt='simple'))
 
     # Bench — players with games today but not in the recommended lineup
@@ -795,7 +796,8 @@ def show_daily_lineup(daily, today):
                        headers=['Player', 'Team', 'Curr', 'Game', ''],
                        tablefmt='simple'))
 
-    print('\n  Score = (per-game projection) × platoon × recent form × park factor.')
+    print('\n  Score = base × platoon × form × park (by hand) × opp SP quality.'
+          '\n  Form: Bayesian-shrunk L14 ratio [0.90–1.10].  SP: ERA vs. league avg [0.85–1.15].')
 
 
 def show_streaming_queue(queue):
@@ -1212,6 +1214,7 @@ def main():
                 batting_cats=[c for c in categories if c['is_batting']],
                 pitching_cats=[c for c in categories if c['is_pitching']],
                 stat_weights=stat_weights,
+                team_games_remaining=team_games_remaining,
             )
             show_daily_lineup(daily, today)
         except Exception as e:

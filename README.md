@@ -73,9 +73,28 @@ External calls are cached in `~/.cache/fantasy-baseball-helper/`.
 
 Use `--no-cache` to fetch everything fresh.
 
+## Daily start/sit scoring
+
+Each non-pitcher gets a daily score used to set the optimal lineup:
+
+```
+score = base × platoon × form × park × opp_sp_quality
+```
+
+| Factor | How it's computed |
+|---|---|
+| **base** | League-weighted per-game value from ROS counting stats |
+| **platoon** | 1.07 opposite-hand, 0.93 same-hand, 1.0 switch — from MLB StatsAPI |
+| **form** | Bayesian-shrunk L14 ratio vs. season pace [0.90–1.10], blended with a 50-PA prior so small samples don't dominate |
+| **park** | Venue factor split by batter handedness (e.g., Fenway 1.03 LHB / 1.09 RHB; Yankee Stadium 1.09 LHB / 1.02 RHB) |
+| **opp SP quality** | `1 + (ERA − 4.20) × 0.04`, clamped [0.85–1.15] — good starters penalise batter scores, bad ones boost them |
+
+UTIL tiebreaks prefer the player whose team has more games remaining in the scoring period.
+
 ## File overview
 
 - `main.py`: CLI orchestration and output sections
+- `daily_lineup.py`: daily start/sit scoring and lineup assignment
 - `league_client.py`: ESPN data access
 - `recommender.py`: ranking, filtering, and consensus logic
 - `roster.py`: lineup feasibility and drop selection
