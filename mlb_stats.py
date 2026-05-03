@@ -44,12 +44,21 @@ def _get_schedule(
     return r.json().get('dates', [])
 
 
+# MLB StatsAPI abbreviations that differ from what ESPN uses.
+_MLB_TO_ESPN_ABBR = {
+    'ATH': 'OAK',   # Athletics (Sacramento era)
+    'AZ':  'ARI',   # Arizona Diamondbacks
+    'CWS': 'CHW',   # Chicago White Sox
+}
+
+
 def _team_abbr(team_obj: dict) -> str:
-    return (
+    raw = (
         team_obj.get('abbreviation')
         or team_obj.get('teamCode')
         or team_obj.get('clubName', '')[:3]
     ).upper().strip()
+    return _MLB_TO_ESPN_ABBR.get(raw, raw)
 
 
 def get_schedule_context(

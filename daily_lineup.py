@@ -485,11 +485,13 @@ def recommend_daily_lineup(
             'has_game':  own is not None,
         }
         if player.position == 'RP':
-            # RPs don't start; only the team's game presence matters today.
-            if own is not None:
-                rps_with_game.append(info)
-            else:
+            if own is None:
                 rps_off.append(info)
+            elif is_pitcher_starting_today(player, daily_matchups):
+                # Spot-starting today despite RP roster position
+                sps_today.append(info)
+            else:
+                rps_with_game.append(info)
             continue
         # SP-eligible (includes 'P' multi-position when treated as SP).
         if own is None:
